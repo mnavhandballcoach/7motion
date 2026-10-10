@@ -22,22 +22,19 @@ async def upload_chunk(
     start_time: int = Form(...),
     duration: int = Form(...)
 ):
-    # Criar diretório dos chunks
     file_dir = os.path.join(CHUNK_DIR, filename)
     os.makedirs(file_dir, exist_ok=True)
 
-    # Guardar chunk
     part_path = os.path.join(file_dir, f"{index}.part")
     with open(part_path, "wb") as f:
         f.write(await chunk.read())
 
-    # Guardar metadata (apenas 1 vez)
     meta_path = os.path.join(META_DIR, f"{filename}.json")
     if not os.path.exists(meta_path):
         metadata = {
             "email": email,
             "name": name,
-            "start": start_time,
+            "start_time": start_time,
             "duration": duration
         }
         with open(meta_path, "w") as m:
@@ -51,7 +48,6 @@ async def finish_upload(filename: str, finish: int = 0):
     if finish != 1:
         return JSONResponse({"error": "invalid_finish_flag"}, status_code=400)
 
-    # Juntar chunks
     file_dir = os.path.join(CHUNK_DIR, filename)
     parts = sorted(os.listdir(file_dir), key=lambda x: int(x.replace(".part", "")))
 
@@ -61,14 +57,11 @@ async def finish_upload(filename: str, finish: int = 0):
             with open(os.path.join(file_dir, part), "rb") as p:
                 final_file.write(p.read())
 
-    # Ler metadata
     meta_path = os.path.join(META_DIR, f"{filename}.json")
     metadata = json.load(open(meta_path))
 
-    # Upload do vídeo
     upload_bytes(f"incoming/{filename}", open(final_path, "rb").read(), "video/mp4")
 
-    # Upload do JSON
     json_name = filename.replace(".mp4", ".json")
     upload_bytes(f"incoming/{json_name}",
                  json.dumps(metadata).encode("utf-8"),
