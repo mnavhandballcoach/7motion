@@ -1,6 +1,8 @@
 import os
 import json
 import shutil
+import uuid
+from datetime import datetime
 from fastapi import APIRouter, UploadFile, Form
 from fastapi.responses import JSONResponse
 from api.b2_client import upload_bytes
@@ -14,6 +16,11 @@ os.makedirs(CHUNK_DIR, exist_ok=True)
 os.makedirs(META_DIR, exist_ok=True)
 
 
+def generate_video_id():
+    now = datetime.utcnow().strftime("%Y-%m-%d_%H%M%S")
+    return f"{now}_{uuid.uuid4().hex[:8]}"
+
+
 @router.post("/upload_chunk")
 async def upload_chunk(
     chunk: UploadFile,
@@ -24,12 +31,12 @@ async def upload_chunk(
     start_time: int = Form(...),
     duration: int = Form(...)
 ):
-    """
-    Recebe um chunk + metadata e guarda tudo.
-    """
+    # Criar ID único para este upload
+    video_id = filename.replace(".mp4", "")
+    unique_id = generate_video_id()
 
     # Pasta dos chunks
-    file_dir = os.path.join(CHUNK_DIR, filename)
+    file_dir = os.path.join(CHUNK_DIR, unique_id)
     os.makedirs(file_dir, exist_ok=True)
 
     # Guardar chunk
@@ -38,30 +45,28 @@ async def upload_chunk(
         f.write(await chunk.read())
 
     # Guardar metadata (apenas 1 vez)
-    meta_path = os.path.join(META_DIR, f"{filename}.json")
+    meta_path = os.path.join(META_DIR, f"{unique_id}.json")
     if not os.path.exists(meta_path):
         metadata = {
             "email": email,
             "name": name,
             "start": start_time,
-            "duration": duration
+            "duration": duration,
+            "original_filename": filename,
+            "video_id": unique_id
         }
         with open(meta_path, "w") as m:
             json.dump(metadata, m)
 
-    return {"status": "chunk_received", "index": index}
+    return {"status": "chunk_received", "index": index, "video_id": unique_id}
 
 
 @router.get("/upload_chunk")
-async def finish_upload(filename: str, finish: int = 0):
-    """
-    Junta todos os chunks, cria o vídeo final, envia vídeo + JSON para o B2.
-    """
-
+async def finish_upload(video_id: str, finish: int = 0):
     if finish != 1:
         return JSONResponse({"error": "invalid_finish_flag"}, status_code=400)
 
-    file_dir = os.path.join(CHUNK_DIR, filename)
+    file_dir = os.path.join(CHUNK_DIR, video_id)
 
     if not os.path.exists(file_dir):
         return JSONResponse({"error": "no_chunks_found"}, status_code=400)
@@ -73,7 +78,9 @@ async def finish_upload(filename: str, finish: int = 0):
     )
 
     # Criar vídeo final
-    final_path = os.path.join(CHUNK_DIR, f"final_{filename}")
+    final_filename = f"{video_id}.mp4"
+    final_path = os.path.join(CHUNK_DIR, final_filename)
+
     with open(final_path, "wb") as final_file:
         for part in parts:
             part_path = os.path.join(file_dir, part)
@@ -81,15 +88,15 @@ async def finish_upload(filename: str, finish: int = 0):
                 final_file.write(p.read())
 
     # Ler metadata
-    meta_path = os.path.join(META_DIR, f"{filename}.json")
+    meta_path = os.path.join(META_DIR, f"{video_id}.json")
     metadata = json.load(open(meta_path))
 
-    # Enviar vídeo para B2
+    # Upload do vídeo
     with open(final_path, "rb") as f:
-        upload_bytes(f"incoming/{filename}", f.read(), "video/mp4")
+        upload_bytes(f"incoming/{final_filename}", f.read(), "video/mp4")
 
-    # Enviar JSON para B2
-    json_name = filename.replace(".mp4", ".json")
+    # Upload do JSON
+    json_name = f"{video_id}.json"
     upload_bytes(
         f"incoming/{json_name}",
         json.dumps(metadata).encode("utf-8"),
