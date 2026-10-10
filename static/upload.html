@@ -4,91 +4,78 @@
     <meta charset="UTF-8">
     <title>Upload de Vídeo</title>
     <style>
-        body { font-family: Arial; padding: 20px; }
-        #status { margin-top: 20px; font-weight: bold; }
+        body { font-family: Arial; margin: 40px; }
+        input, button { margin: 10px 0; padding: 8px; width: 300px; }
     </style>
 </head>
 <body>
 
-<h2>Enviar Vídeo</h2>
+<h2>Upload de Vídeo</h2>
 
-<input type="file" id="videoInput" accept="video/*">
-<br><br>
+<label>Email:</label><br>
+<input type="email" id="email" placeholder="email@example.com" required><br>
 
-<button onclick="startUpload()">Enviar</button>
+<label>Nome:</label><br>
+<input type="text" id="name" placeholder="Nome do utilizador" required><br>
 
-<div id="status"></div>
+<label>Início (segundos):</label><br>
+<input type="number" id="start_time" placeholder="Ex: 12" required><br>
+
+<label>Duração (segundos):</label><br>
+<input type="number" id="duration" placeholder="Ex: 8" required><br>
+
+<label>Vídeo:</label><br>
+<input type="file" id="video" accept="video/*" required><br>
+
+<button onclick="uploadVideo()">Enviar Vídeo</button>
+
+<p id="status"></p>
 
 <script>
 const backendUrl = "https://hb-7motion-1007213034860.europe-west1.run.app";
 
-async function startUpload() {
-    const file = document.getElementById("videoInput").files[0];
+async function uploadVideo() {
+    const file = document.getElementById("video").files[0];
+    const email = document.getElementById("email").value;
+    const name = document.getElementById("name").value;
+    const start_time = document.getElementById("start_time").value;
+    const duration = document.getElementById("duration").value;
+
     if (!file) {
-        alert("Escolhe um vídeo primeiro.");
+        document.getElementById("status").innerText = "Escolhe um vídeo.";
         return;
     }
 
     const chunkSize = 5 * 1024 * 1024; // 5MB
-    const totalChunks = Math.ceil(file.size / chunkSize);
+    let offset = 0;
 
-    document.getElementById("status").innerText = "STATUS: 🚀 A enviar vídeo em chunks...";
-
-    for (let index = 0; index < totalChunks; index++) {
-        const start = index * chunkSize;
-        const end = Math.min(start + chunkSize, file.size);
-        const chunk = file.slice(start, end);
-
-        console.log("DEBUG: Enviando chunk", index, "tamanho:", chunk.size);
+    while (offset < file.size) {
+        const chunk = file.slice(offset, offset + chunkSize);
 
         const formData = new FormData();
-        formData.append("chunk", chunk);
-        formData.append("index", index);
+        formData.append("file", chunk);
         formData.append("filename", file.name);
-        formData.append("user_name", ""); 
-        formData.append("user_email", "");
-        formData.append("start_time", "0");
-        formData.append("duration", "0");
+        formData.append("offset", offset);
+        formData.append("email", email);
+        formData.append("name", name);
+        formData.append("start_time", start_time);
+        formData.append("duration", duration);
 
-        try {
-            const response = await fetch(backendUrl + "/upload_chunk", {
-                method: "POST",
-                body: formData
-            });
+        const response = await fetch(`${backendUrl}/upload_chunk`, {
+            method: "POST",
+            body: formData
+        });
 
-            if (!response.ok) {
-                throw new Error("Erro no chunk " + index);
-            }
-
-            console.log("✔ Chunk", index, "enviado");
-        } catch (err) {
-            console.error("DEBUG: ERRO FINAL:", err);
-            document.getElementById("status").innerText =
-                "STATUS: ❌ Erro no upload: " + err;
+        if (!response.ok) {
+            document.getElementById("status").innerText = "❌ Erro no upload.";
             return;
         }
+
+        offset += chunkSize;
+        document.getElementById("status").innerText = `Enviado: ${Math.min(offset, file.size)} / ${file.size} bytes`;
     }
 
-    // Finalizar upload
-    document.getElementById("status").innerText = "STATUS: 🔄 A finalizar vídeo...";
-
-    const finishUrl = backendUrl + "/upload_chunk?finish=1&filename=" + encodeURIComponent(file.name);
-
-    try {
-        const response = await fetch(finishUrl);
-        const data = await response.json();
-
-        if (data.status === "upload_complete") {
-            document.getElementById("status").innerText =
-                "STATUS: ✅ Upload concluído com sucesso!";
-        } else {
-            throw new Error("Erro ao finalizar");
-        }
-    } catch (err) {
-        console.error(err);
-        document.getElementById("status").innerText =
-            "STATUS: ❌ Erro ao finalizar upload.";
-    }
+    document.getElementById("status").innerText = "✔ Upload concluído!";
 }
 </script>
 
