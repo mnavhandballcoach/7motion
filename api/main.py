@@ -2,7 +2,6 @@ from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
-import os
 
 from api.upload_chunk import router as upload_router
 
@@ -16,8 +15,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Caminho absoluto para a pasta static dentro do container
-static_dir = os.path.join(os.path.dirname(__file__), "..", "static")
+# Caminho correto para a pasta static dentro do container
+static_dir = "/app/static"
 
 # Servir ficheiros estáticos
 app.mount("/static", StaticFiles(directory=static_dir), name="static")
@@ -25,7 +24,7 @@ app.mount("/static", StaticFiles(directory=static_dir), name="static")
 # Página inicial → devolve o upload.html
 @app.get("/", response_class=HTMLResponse)
 def index():
-    return open(os.path.join(static_dir, "upload.html"), "r").read()
+    return open("/app/static/upload.html", "r").read()
 
 # Router do upload
 app.include_router(upload_router)
