@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="pt">
+<head>
+    <meta charset="UTF-8">
+    <title>Upload de Vídeo</title>
+    <style>
+        body { font-family: Arial; padding: 20px; }
+        #status { margin-top: 20px; font-weight: bold; }
+    </style>
+</head>
+<body>
+
+<h2>Enviar Vídeo</h2>
+
+<input type="file" id="videoInput" accept="video/*">
+<br><br>
+
+<button onclick="startUpload()">Enviar</button>
+
+<div id="status"></div>
+
+<script>
+const backendUrl = "https://handball-video-pipeline-git-1007213034860.europe-west1.run.app";
+
+async function startUpload() {
+    const file = document.getElementById("videoInput").files[0];
+    if (!file) {
+        alert("Escolhe um vídeo primeiro.");
+        return;
+    }
+
+    const chunkSize = 5 * 1024 * 1024; // 5MB
+    const totalChunks = Math.ceil(file.size / chunkSize);
+
+    document.getElementById("status").innerText = "STATUS: 🚀 A enviar vídeo em chunks...";
+
+    for (let index = 0; index < totalChunks; index++) {
+        const start = index * chunkSize;
+        const end = Math.min(start + chunkSize, file.size);
+        const chunk = file.slice(start, end);
+
+        console.log("DEBUG: Enviando chunk", index, "tamanho:", chunk.size);
+
+        const formData = new FormData();
+        formData.append("chunk", chunk);
+        formData.append("index", index);
+        formData.append("filename", file.name);
+        formData.append("user_name", ""); 
+        formData.append("user_email", "");
+        formData.append("start_time", "0");
+        formData.append("duration", "0");
+
+        try {
+            const response = await fetch(backendUrl + "/upload_chunk", {
+                method: "POST",
+                body: formData
+            });
+
+            if (!response.ok) {
+                throw new Error("Erro no chunk " + index);
+            }
+
+            console.log("✔ Chunk", index, "enviado");
+        } catch (err) {
+            console.error("DEBUG: ERRO FINAL:", err);
+            document.getElementById("status").innerText =
+                "STATUS: ❌ Erro no upload: " + err;
+            return;
+        }
+    }
+
+    // Finalizar upload
+    document.getElementById("status").innerText = "STATUS: 🔄 A finalizar vídeo...";
+
+    const finishUrl = backendUrl + "/upload_chunk?finish=1&filename=" + encodeURIComponent(file.name);
+
+    try {
+        const response = await fetch(finishUrl);
+        const data = await response.json();
+
+        if (data.status === "upload_complete") {
+            document.getElementById("status").innerText =
+                "STATUS: ✅ Upload concluído com sucesso!";
+        } else {
+            throw new Error("Erro ao finalizar");
+        }
+    } catch (err) {
+        console.error(err);
+        document.getElementById("status").innerText =
+            "STATUS: ❌ Erro ao finalizar upload.";
+    }
+}
+</script>
+
+</body>
+</html>
