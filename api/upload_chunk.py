@@ -37,7 +37,7 @@ async def upload_chunk(
         metadata = {
             "email": email,
             "name": name,
-            "start_time": start_time,
+            "start": start_time,
             "duration": duration
         }
         with open(meta_path, "w") as m:
@@ -69,7 +69,8 @@ async def finish_upload(filename: str, finish: int = 0):
     upload_bytes(f"incoming/{filename}", open(final_path, "rb").read(), "video/mp4")
 
     # Upload do JSON
-    upload_bytes(f"incoming/{filename.replace('.mp4', '.json')}",
+    json_name = filename.replace(".mp4", ".json")
+    upload_bytes(f"incoming/{json_name}",
                  json.dumps(metadata).encode("utf-8"),
                  "application/json")
 
