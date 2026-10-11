@@ -47,6 +47,9 @@ async function uploadVideo() {
         return;
     }
 
+    // ID fixo para todos os chunks
+    const video_id = file.name.replace(".mp4", "").replace(".mov", "");
+
     const chunkSize = 5 * 1024 * 1024; // 5MB
     let offset = 0;
 
@@ -73,14 +76,27 @@ async function uploadVideo() {
         }
 
         offset += chunkSize;
-        document.getElementById("status").innerText = `Enviado: ${Math.min(offset, file.size)} / ${file.size} bytes`;
+        document.getElementById("status").innerText =
+            `Enviado: ${Math.min(offset, file.size)} / ${file.size} bytes`;
     }
 
-    // Finalizar upload
-    await fetch(`${backendUrl}/upload_chunk?filename=${file.name}&finish=1`);
+    // Finalizar upload (POST)
+    const finishData = new FormData();
+    finishData.append("video_id", video_id);
+
+    const finishResponse = await fetch(`${backendUrl}/upload_chunk/finish`, {
+        method: "POST",
+        body: finishData
+    });
+
+    if (!finishResponse.ok) {
+        document.getElementById("status").innerText = "❌ Erro ao finalizar o upload.";
+        return;
+    }
 
     document.getElementById("status").innerText = "✔ Upload concluído!";
 }
+
 </script>
 
 </body>
