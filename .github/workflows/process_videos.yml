@@ -45,4 +45,4 @@ jobs:
         SMTP_USER: ${{ secrets.SMTP_USER }}
         SMTP_PASS: ${{ secrets.SMTP_PASS }}
       run: |
-        python process_video.py
+        python process/process_video.py
