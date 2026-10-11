@@ -1,8 +1,6 @@
 import os
 import json
 import shutil
-import uuid
-from datetime import datetime
 from fastapi import APIRouter, UploadFile, Form
 from fastapi.responses import JSONResponse
 from api.b2_client import upload_bytes
@@ -16,11 +14,6 @@ os.makedirs(CHUNK_DIR, exist_ok=True)
 os.makedirs(META_DIR, exist_ok=True)
 
 
-def generate_video_id():
-    now = datetime.utcnow().strftime("%Y-%m-%d_%H%M%S")
-    return f"{now}_{uuid.uuid4().hex[:8]}"
-
-
 @router.post("/upload_chunk")
 async def upload_chunk(
     chunk: UploadFile,
@@ -31,12 +24,11 @@ async def upload_chunk(
     start_time: int = Form(...),
     duration: int = Form(...)
 ):
-    # Criar ID único para este upload
-    video_id = filename.replace(".mp4", "")
-    unique_id = generate_video_id()
+    # ID fixo baseado no nome do ficheiro
+    video_id = filename.replace(".mp4", "").replace(".mov", "")
 
     # Pasta dos chunks
-    file_dir = os.path.join(CHUNK_DIR, unique_id)
+    file_dir = os.path.join(CHUNK_DIR, video_id)
     os.makedirs(file_dir, exist_ok=True)
 
     # Guardar chunk
@@ -45,7 +37,7 @@ async def upload_chunk(
         f.write(await chunk.read())
 
     # Guardar metadata (apenas 1 vez)
-    meta_path = os.path.join(META_DIR, f"{unique_id}.json")
+    meta_path = os.path.join(META_DIR, f"{video_id}.json")
     if not os.path.exists(meta_path):
         metadata = {
             "email": email,
@@ -53,19 +45,16 @@ async def upload_chunk(
             "start": start_time,
             "duration": duration,
             "original_filename": filename,
-            "video_id": unique_id
+            "video_id": video_id
         }
         with open(meta_path, "w") as m:
             json.dump(metadata, m)
 
-    return {"status": "chunk_received", "index": index, "video_id": unique_id}
+    return {"status": "chunk_received", "index": index, "video_id": video_id}
 
 
-@router.get("/upload_chunk")
-async def finish_upload(video_id: str, finish: int = 0):
-    if finish != 1:
-        return JSONResponse({"error": "invalid_finish_flag"}, status_code=400)
-
+@router.post("/upload_chunk/finish")
+async def finish_upload(video_id: str = Form(...)):
     file_dir = os.path.join(CHUNK_DIR, video_id)
 
     if not os.path.exists(file_dir):
