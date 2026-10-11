@@ -19,8 +19,8 @@ print("==============================\n")
 
 USE_TEAM_CLASSIFIER = False
 
-MODEL_URL = "https://github.com/mnavhandballcoach/handball-video-pipeline/releases/download/model/best.pt"
-CLASSIFIER_URL = "https://github.com/mnavhandballcoach/handball-video-pipeline/releases/download/model/bestclassifier.pt"
+MODEL_URL = "https://github.com/mnavhandballcoach/7motion/releases/download/models/best.pt"
+CLASSIFIER_URL = "https://github.com/mnavhandballcoach/7motion/releases/download/models/bestclassifier.pt"
 
 BUCKET_NAME = "handball-videos"
 S3_ENDPOINT = "https://s3.eu-central-003.backblazeb2.com"
