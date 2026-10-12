@@ -1,7 +1,7 @@
 # ============================
 # Team Classifier Toggle
 # ============================
-USE_TEAM_CLASSIFIER = False  # TRUE or FALSE
+USE_TEAM_CLASSIFIER = True  # agora ativo
 
 import sys
 import os
@@ -14,7 +14,7 @@ import requests
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from process.core.models import load_yolo_model, load_team_classifier
+from process.core.models import load_yolo_model
 from process.core.cropper import crop_with_pad, is_box_too_small
 from process.core.classifier import classify_team
 from process.core.ema import init_track_memory, update_ema, decide_team
@@ -30,7 +30,7 @@ print("   PROCESS VIDEO PIPELINE — engine profissional")
 print("==============================\n")
 
 
-def process_video(model, classifier, local_video, original_name):
+def process_video(model, local_video, original_name):
     cap = cv2.VideoCapture(local_video)
     fps = cap.get(cv2.CAP_PROP_FPS)
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -85,11 +85,17 @@ def process_video(model, classifier, local_video, original_name):
 
             track_id = int(box.id[0]) if box.id is not None else None
 
+            # -------------------------
+            # REFEREE
+            # -------------------------
             if base_label == "referee":
                 label_str = draw_entity(frame, "referee", None, x1, y1, x2, y2)
                 labels_file.write(f"{frame_name} {label_str}\n")
                 continue
 
+            # -------------------------
+            # BALL
+            # -------------------------
             if base_label == "ball":
                 label_str = draw_entity(frame, "ball", None, x1, y1, x2, y2)
                 labels_file.write(f"{frame_name} {label_str}\n")
@@ -98,19 +104,28 @@ def process_video(model, classifier, local_video, original_name):
             role = base_label
             team_raw = None
 
+            # -------------------------
+            # TRACK MEMORY INIT
+            # -------------------------
             if track_id is not None:
                 init_track_memory(team_memory, fallback_counter, last_team, track_id)
 
+            # -------------------------
+            # TEAM CLASSIFICATION
+            # -------------------------
             if is_box_too_small(w_box, h_box):
                 team_raw = None
             else:
                 crop, _ = crop_with_pad(frame, x1, y1, x2, y2, w, h)
 
-                if USE_TEAM_CLASSIFIER and classifier is not None:
-                    team_raw = classify_team(crop, classifier, w_box, h_box, w, h)
+                if USE_TEAM_CLASSIFIER:
+                    team_raw = classify_team(crop)
                 else:
                     team_raw = None
 
+            # -------------------------
+            # EMA + FALLBACK
+            # -------------------------
             if track_id is not None:
                 update_ema(team_memory, track_id, team_raw)
                 team = decide_team(team_memory, track_id)
@@ -118,6 +133,9 @@ def process_video(model, classifier, local_video, original_name):
             else:
                 team = team_raw
 
+            # -------------------------
+            # DRAW ENTITY
+            # -------------------------
             label_str = draw_entity(frame, role, team, x1, y1, x2, y2)
             labels_file.write(f"{frame_name} {label_str}\n")
 
@@ -136,7 +154,6 @@ def main():
     print(">>> USING process_video — engine profissional <<<")
 
     model = load_yolo_model()
-    classifier = load_team_classifier() if USE_TEAM_CLASSIFIER else None
 
     files_all, files_videos = list_incoming()
     if not files_videos:
@@ -168,7 +185,7 @@ def main():
         safe_video = convert_video_to_safe_format(cut_path)
 
         output_video, frames_dir, labels_path = process_video(
-            model, classifier, safe_video, os.path.basename(key)
+            model, safe_video, os.path.basename(key)
         )
 
         annotated_remote = f"processed/{os.path.basename(output_video)}"
