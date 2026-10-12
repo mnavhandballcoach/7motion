@@ -3,22 +3,19 @@ import torchvision.transforms as transforms
 from PIL import Image
 from .utils import laplacian_variance
 
-# 🔥 PyTorch 2.6 fix — permitir a classe usada no checkpoint YOLO
-from torch.serialization import add_safe_globals
-import ultralytics.nn.tasks as ul_tasks
-add_safe_globals([ul_tasks.ClassificationModel])
+from ultralytics import YOLO
 
 IMG_SIZE = 224
 
 class TeamClassifier:
     def __init__(self, model_path):
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        print("[TeamClassifier] Using device:", self.device)
+        print("[TeamClassifier] Loading YOLO classification model...")
 
-        # Agora funciona no PyTorch 2.6
-        self.model = torch.load(model_path, map_location=self.device, weights_only=False)
-        self.model.to(self.device)
-        self.model.eval()
+        # Carrega o modelo YOLO corretamente
+        self.model = YOLO(model_path)
+
+        # YOLO já trata device internamente
+        self.device = self.model.device
 
         self.transform = transforms.Compose([
             transforms.Resize((IMG_SIZE, IMG_SIZE)),
@@ -32,11 +29,11 @@ class TeamClassifier:
         return self.transform(img)
 
     def predict(self, crop_bgr):
-        tensor = self.preprocess(crop_bgr).unsqueeze(0).to(self.device)
+        # YOLO classification aceita diretamente imagens numpy
+        results = self.model(crop_bgr)
 
-        with torch.no_grad():
-            output = self.model(tensor)
-            pred = output.argmax(dim=1).cpu().item()
+        # top1 da classificação YOLO
+        pred = results[0].probs.top1
 
         raw = self.classes[pred]
 
