@@ -16,7 +16,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from process.core.models import load_yolo_model, load_team_classifier
 from process.core.cropper import crop_with_pad, is_box_too_small
-from process.core.classifier import classify_team
+from process.core.classifier import classify_team, TeamClassifier
 from process.core.ema import init_track_memory, update_ema, decide_team
 from process.core.fallback import apply_fallback
 from process.core.drawer import draw_entity
@@ -30,7 +30,7 @@ print("   PROCESS VIDEO PIPELINE — engine profissional")
 print("==============================\n")
 
 
-def process_video(model, local_video, original_name):
+def process_video(model, classifier, local_video, original_name):
     cap = cv2.VideoCapture(local_video)
     fps = cap.get(cv2.CAP_PROP_FPS)
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -119,7 +119,7 @@ def process_video(model, local_video, original_name):
                 crop, _ = crop_with_pad(frame, x1, y1, x2, y2, w, h)
 
                 if USE_TEAM_CLASSIFIER:
-                    team_raw = classify_team(crop)
+                    team_raw = classify_team(crop, classifier)
                 else:
                     team_raw = None
 
@@ -156,8 +156,10 @@ def main():
     model = load_yolo_model()
 
     # 🔥 GARANTE DOWNLOAD DO MODELO PYTORCH
+    classifier = None
     if USE_TEAM_CLASSIFIER:
-        load_team_classifier()
+        load_team_classifier()  # descarrega bestclassifier.pt
+        classifier = TeamClassifier("bestclassifier.pt")  # carrega PyTorch
 
     files_all, files_videos = list_incoming()
     if not files_videos:
@@ -189,7 +191,7 @@ def main():
         safe_video = convert_video_to_safe_format(cut_path)
 
         output_video, frames_dir, labels_path = process_video(
-            model, safe_video, os.path.basename(key)
+            model, classifier, safe_video, os.path.basename(key)
         )
 
         annotated_remote = f"processed/{os.path.basename(output_video)}"
