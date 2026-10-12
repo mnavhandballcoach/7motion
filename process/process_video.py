@@ -1,18 +1,18 @@
 # ============================
 # Team Classifier Toggle
 # ============================
-USE_TEAM_CLASSIFIER = False # TRUE or FALSE
+USE_TEAM_CLASSIFIER = False  # TRUE or FALSE
 
 import sys
 import os
+import cv2
+import shutil
+import json
+import requests
 
 # Garantir que process/, process/io/, process/core/ entram no PYTHONPATH
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-
-import cv2
-import shutil
-import json
 
 from process.core.models import load_yolo_model, load_team_classifier
 from process.core.cropper import crop_with_pad, is_box_too_small
@@ -28,6 +28,7 @@ from process.io.emailer import send_email
 print("\n==============================")
 print("   PROCESS VIDEO PIPELINE — engine profissional")
 print("==============================\n")
+
 
 def process_video(model, classifier, local_video, original_name):
     cap = cv2.VideoCapture(local_video)
@@ -130,6 +131,7 @@ def process_video(model, classifier, local_video, original_name):
 
     return output_video, frames_dir, labels_path
 
+
 def main():
     print(">>> USING process_video — engine profissional <<<")
 
@@ -183,14 +185,42 @@ def main():
 
         upload_file(labels_path, f"processed/labels/{os.path.basename(labels_path)}")
 
+        # ---------------------------------------------------------
+        # 1) LINK DO VÍDEO NO BACKBLAZE
+        # ---------------------------------------------------------
         video_url = (
             f"https://f003.backblazeb2.com/file/"
             f"{os.getenv('VIDEOS_BUCKET', 'handball-videos')}/"
             f"{annotated_remote}"
         )
 
-        send_email(user_email, user_name, video_url)
+        # ---------------------------------------------------------
+        # 2) CRIAR PÁGINA WORDPRESS AUTOMÁTICA
+        # ---------------------------------------------------------
+        wordpress_endpoint = "https://mariocesar.navarro.pt/wp/wp-json/7motion/v1/create-video-page"
 
+        payload = {
+            "video_url": video_url,
+            "user_email": user_email,
+            "user_name": user_name,
+            "video_id": os.path.splitext(os.path.basename(key))[0],
+        }
+
+        try:
+            resp = requests.post(wordpress_endpoint, json=payload, timeout=20)
+            data_wp = resp.json()
+            page_url = data_wp.get("page_url", video_url)  # fallback
+        except Exception:
+            page_url = video_url  # fallback se WP falhar
+
+        # ---------------------------------------------------------
+        # 3) ENVIAR EMAIL COM LINK WORDPRESS
+        # ---------------------------------------------------------
+        send_email(user_email, user_name, page_url)
+
+        # ---------------------------------------------------------
+        # LIMPEZA
+        # ---------------------------------------------------------
         shutil.rmtree("output", ignore_errors=True)
         shutil.rmtree("output_frames", ignore_errors=True)
         shutil.rmtree("output_labels", ignore_errors=True)
@@ -198,6 +228,7 @@ def main():
         os.remove(local_video)
         os.remove(safe_video)
         os.remove(local_json)
+
 
 if __name__ == "__main__":
     main()
