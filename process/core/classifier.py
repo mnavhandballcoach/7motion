@@ -41,10 +41,7 @@ class TeamClassifier:
         return None
 
 
-team_model = TeamClassifier("bestclassifier.pt")
-
-
-def classify_team(crop):
+def classify_team(crop, classifier):
     if crop is None or crop.size == 0:
         return None
 
@@ -52,7 +49,7 @@ def classify_team(crop):
         return None
 
     try:
-        return team_model.predict(crop)
+        return classifier.predict(crop)
     except Exception as e:
         print("[TeamClassifier] Error:", e)
         return None
