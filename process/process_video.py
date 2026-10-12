@@ -10,13 +10,12 @@ import shutil
 import json
 import requests
 
-# Garantir que process/, process/io/, process/core/ entram no PYTHONPATH
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from process.core.models import load_yolo_model, load_team_classifier
 from process.core.cropper import crop_with_pad, is_box_too_small
-from process.core.classifier import TeamClassifier   # <-- só isto
+from process.core.classifier import TeamClassifier
 from process.core.ema import init_track_memory, update_ema, decide_team
 from process.core.fallback import apply_fallback
 from process.core.drawer import draw_entity
@@ -64,7 +63,6 @@ def process_video(model, classifier, local_video, original_name):
     last_team = {}
     fallback_counter = {}
 
-    # Classes que devem ser classificadas
     CLASSIFY_CLASSES = ("player", "goalkeeper")
 
     while True:
@@ -88,53 +86,35 @@ def process_video(model, classifier, local_video, original_name):
 
             track_id = int(box.id[0]) if box.id is not None else None
 
-            # -------------------------
-            # REFEREE
-            # -------------------------
             if base_label == "referee":
                 label_str = draw_entity(frame, "referee", None, x1, y1, x2, y2)
                 labels_file.write(f"{frame_name} {label_str}\n")
                 continue
 
-            # -------------------------
-            # BALL
-            # -------------------------
             if base_label == "ball":
                 label_str = draw_entity(frame, "ball", None, x1, y1, x2, y2)
                 labels_file.write(f"{frame_name} {label_str}\n")
                 continue
 
-            # -------------------------
-            # IGNORAR CLASSES NÃO-CLASSIFICÁVEIS
-            # -------------------------
             if base_label not in CLASSIFY_CLASSES:
                 continue
 
             role = base_label
             team_raw = None
 
-            # -------------------------
-            # TRACK MEMORY INIT
-            # -------------------------
             if track_id is not None:
                 init_track_memory(team_memory, fallback_counter, last_team, track_id)
 
-            # -------------------------
-            # TEAM CLASSIFICATION
-            # -------------------------
             if is_box_too_small(w_box, h_box):
                 team_raw = None
             else:
                 crop, _ = crop_with_pad(frame, x1, y1, x2, y2, w, h)
 
-                if USE_TEAM_CLASSIFIER:
+                if USE_TEAM_CLASSIFIER and classifier is not None:
                     team_raw = classifier.predict_batch([crop])[0]
                 else:
                     team_raw = None
 
-            # -------------------------
-            # EMA + FALLBACK
-            # -------------------------
             if track_id is not None:
                 update_ema(team_memory, track_id, team_raw)
                 team = decide_team(team_memory, track_id)
@@ -142,9 +122,6 @@ def process_video(model, classifier, local_video, original_name):
             else:
                 team = team_raw
 
-            # -------------------------
-            # DRAW ENTITY
-            # -------------------------
             label_str = draw_entity(frame, role, team, x1, y1, x2, y2)
             labels_file.write(f"{frame_name} {label_str}\n")
 
@@ -164,10 +141,9 @@ def main():
 
     model = load_yolo_model()
 
-    # 🔥 CARREGAR CLASSIFICADOR YOLO
     classifier = None
     if USE_TEAM_CLASSIFIER:
-        load_team_classifier()  # descarrega bestclassifier.pt
+        load_team_classifier()
         classifier = TeamClassifier("bestclassifier.pt")
 
     files_all, files_videos = list_incoming()
