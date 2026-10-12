@@ -1,23 +1,29 @@
 # ============================
 # Team Classifier Toggle
 # ============================
-USE_TEAM_CLASSIFIER = True   # <---- Ligar / Desligar aqui
+USE_TEAM_CLASSIFIER = True
 
+import sys
 import os
+
+# Garantir que process/, process/io/, process/core/ entram no PYTHONPATH
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
 import cv2
 import shutil
 import json
 
-from core.models import load_yolo_model, load_team_classifier
-from core.cropper import crop_with_pad, is_box_too_small
-from core.classifier import classify_team
-from core.ema import init_track_memory, update_ema, decide_team
-from core.fallback import apply_fallback
-from core.drawer import draw_entity
+from process.core.models import load_yolo_model, load_team_classifier
+from process.core.cropper import crop_with_pad, is_box_too_small
+from process.core.classifier import classify_team
+from process.core.ema import init_track_memory, update_ema, decide_team
+from process.core.fallback import apply_fallback
+from process.core.drawer import draw_entity
 
-from io.storage import list_incoming, download_video_and_json, upload_file, delete_incoming
-from io.ffmpeg import cut_video, convert_video_to_safe_format
-from io.emailer import send_email
+from process.io.storage import list_incoming, download_video_and_json, upload_file, delete_incoming
+from process.io.ffmpeg import cut_video, convert_video_to_safe_format
+from process.io.emailer import send_email
 
 print("\n==============================")
 print("   PROCESS VIDEO PIPELINE — engine profissional")
