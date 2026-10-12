@@ -1,23 +1,53 @@
-from .utils import parse_team_classifier_label, laplacian_variance
+import torch
+import torchvision.transforms as transforms
+from PIL import Image
+from .utils import laplacian_variance
 
-def adaptive_conf_min(w_box, h_box, w, h):
-    area_ratio = (w_box * h_box) / (w * h + 1e-6)
-    conf_min = 0.70 - area_ratio * 0.25
-    return max(0.45, conf_min)
+IMG_SIZE = 224
 
-def classify_team(crop, classifier, w_box, h_box, w, h):
+class TeamClassifier:
+    def __init__(self, model_path):
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        print("[TeamClassifier] Using device:", self.device)
+
+        self.model = torch.load(model_path, map_location=self.device)
+        self.model.to(self.device)
+        self.model.eval()
+
+        self.transform = transforms.Compose([
+            transforms.Resize((IMG_SIZE, IMG_SIZE)),
+            transforms.ToTensor(),
+        ])
+
+        self.classes = ["Team A", "Team B"]
+
+    def preprocess(self, crop_bgr):
+        img = Image.fromarray(crop_bgr[:, :, ::-1])
+        return self.transform(img)
+
+    def predict(self, crop_bgr):
+        tensor = self.preprocess(crop_bgr).unsqueeze(0).to(self.device)
+
+        with torch.no_grad():
+            output = self.model(tensor)
+            pred = output.argmax(dim=1).cpu().item()
+
+        return self.classes[pred]
+
+
+# Load model from GitHub release
+team_model = TeamClassifier("models/bestclassifier.pt")
+
+
+def classify_team(crop):
     if crop is None or crop.size == 0:
         return None
 
     if laplacian_variance(crop) < 15:
         return None
 
-    cls_results = classifier(crop)
-    team_idx = int(cls_results[0].probs.top1)
-    conf = float(cls_results[0].probs.top1conf)
-    raw_label = classifier.names[team_idx]
-
-    conf_min = adaptive_conf_min(w_box, h_box, w, h)
-    if conf >= conf_min:
-        return parse_team_classifier_label(raw_label)
-    return None
+    try:
+        return team_model.predict(crop)
+    except Exception as e:
+        print("[TeamClassifier] Error:", e)
+        return None
