@@ -34,7 +34,6 @@ class TeamClassifier:
 
         raw = self.classes[pred]
 
-        # Converter para "A"/"B" para EMA/fallback
         if raw == "Team A":
             return "A"
         if raw == "Team B":
@@ -42,7 +41,6 @@ class TeamClassifier:
         return None
 
 
-# Usa o ficheiro descarregado por core/models.py
 team_model = TeamClassifier("bestclassifier.pt")
 
 
