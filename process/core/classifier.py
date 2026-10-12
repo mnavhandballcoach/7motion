@@ -7,7 +7,7 @@ class TeamClassifier:
     def __init__(self, model_path="bestclassifier.pt"):
         print("[TeamClassifier] Loading YOLO classification model...")
         self.model = YOLO(model_path)
-        self.classes = ["Team A", "Team B"]
+        self.classes = ["A", "B"]
 
     def predict_batch(self, crops_bgr):
         if len(crops_bgr) == 0:
