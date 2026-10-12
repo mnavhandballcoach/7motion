@@ -1,22 +1,48 @@
 import os
 import cv2
+import shutil
+import boto3
+import requests
+import subprocess
 import numpy as np
+import json
 from ultralytics import YOLO
 
+from api.b2_client import hard_delete_file
+
+# =============================================================
 # DEBUG FLAGS
+# =============================================================
 DEBUG = True
-DEBUG_CLASSIFIER = True
 DEBUG_CROP = True
-DEBUG_TRACK = True
+DEBUG_CLASSIFIER = True
 DEBUG_TEAM = True
+DEBUG_TRACK = True
 
-COLOR_PLAYER_YOLO = (180, 80, 80)
-COLOR_GOALKEEPER_YOLO = (120, 220, 120)
-COLOR_REFEREE = (200, 200, 200)
-COLOR_BALL = (255, 255, 0)
+# =============================================================
+# CONFIG
+# =============================================================
+USE_TEAM_CLASSIFIER = True
 
-COLOR_TEAM_A = (0, 0, 255)
-COLOR_TEAM_B = (0, 255, 0)
+MODEL_URL = "https://github.com/mnavhandballcoach/7motion/releases/download/models/best.pt"
+CLASSIFIER_URL = "https://github.com/mnavhandballcoach/7motion/releases/download/models/bestclassifier.pt"
+
+BUCKET_NAME = "handball-videos"
+S3_ENDPOINT = "https://s3.eu-central-003.backblazeb2.com"
+
+AWS_KEY = os.getenv("AWS_ACCESS_KEY_ID")
+AWS_SECRET = os.getenv("AWS_SECRET_ACCESS_KEY")
+
+s3 = boto3.client(
+    "s3",
+    endpoint_url=S3_ENDPOINT,
+    aws_access_key_id=AWS_KEY,
+    aws_secret_access_key=AWS_SECRET
+)
+
+# =============================================================
+# HELPERS
+# =============================================================
 
 def parse_team_classifier_label(label_str):
     label_str = label_str.strip().lower()
@@ -26,8 +52,64 @@ def parse_team_classifier_label(label_str):
         return "B"
     return None
 
-def process_video(model, classifier, local_video, original_name):
 
+def download_model(url, filename):
+    print(f"⬇️ Downloading model: {filename}")
+    r = requests.get(url)
+    r.raise_for_status()
+    with open(filename, "wb") as f:
+        f.write(r.content)
+    print(f"✔ Model downloaded: {filename}\n")
+    return filename
+
+
+def list_incoming():
+    print("📂 Listing videos in incoming/")
+    resp = s3.list_objects_v2(Bucket=BUCKET_NAME, Prefix="incoming/")
+    files = resp.get("Contents", []) or []
+    videos = [f for f in files if f["Key"].lower().endswith((".mp4", ".mov", ".avi", ".mkv"))]
+    print(f"✔ Found {len(videos)} videos\n")
+    return videos
+
+
+def download_video_and_json(key):
+    print(f"⬇️ Downloading video + JSON for {key}")
+
+    local_video = "input.mp4"
+    local_json = "input.json"
+
+    obj = s3.get_object(Bucket=BUCKET_NAME, Key=key)
+    with open(local_video, "wb") as f:
+        f.write(obj["Body"].read())
+    print("✔ Video downloaded")
+
+    json_key = key.replace(".mp4", ".json")
+    try:
+        obj = s3.get_object(Bucket=BUCKET_NAME, Key=json_key)
+        with open(local_json, "wb") as f:
+            f.write(obj["Body"].read())
+        print("✔ JSON downloaded")
+    except Exception:
+        print("⚠️ JSON not found, using defaults")
+        with open(local_json, "w") as f:
+            json.dump({"email": None, "name": None, "start": 0, "duration": 0}, f)
+
+    return local_video, local_json
+
+
+def convert_video_to_safe_format(input_path):
+    print("🎞 Converting video to safe format...")
+    safe_path = "safe_input.mp4"
+    cmd = ["ffmpeg", "-y", "-i", input_path, "-movflags", "faststart", "-pix_fmt", "yuv420p", safe_path]
+    subprocess.run(cmd, check=True)
+    print("✔ Safe video created\n")
+    return safe_path
+
+# =============================================================
+# DEBUG PROCESSING
+# =============================================================
+
+def process_video_debug(model, classifier, local_video, original_name):
     print("\n==============================")
     print("   DEBUG MODE: TeamClassifier")
     print("==============================\n")
@@ -46,19 +128,16 @@ def process_video(model, classifier, local_video, original_name):
     )
 
     frame_index = 0
-    team_memory = {}
-    EMA_ALPHA = 0.25
-    CONF_THRESHOLD = 0.40
 
     while True:
         ret, frame = cap.read()
         if not ret:
             break
 
+        print(f"\n--- FRAME {frame_index} ---")
+
         results = model.track(frame, persist=True)
         detections = results[0].boxes
-
-        print(f"\n--- FRAME {frame_index} ---")
 
         for box in detections:
             cls = int(box.cls[0])
@@ -70,26 +149,18 @@ def process_video(model, classifier, local_video, original_name):
 
             track_id = int(box.id[0]) if box.id is not None else None
 
-            print(f"\nObject: {base_label} | track_id={track_id}")
+            print(f"Object: {base_label} | track_id={track_id}")
             print(f"Box: {x1},{y1},{x2},{y2}")
 
-            # REFEREE
-            if base_label == "referee":
-                print("→ YOLO: Referee")
-                continue
-
-            # BALL
-            if base_label == "ball":
-                print("→ YOLO: Ball")
+            # REFEREE / BALL
+            if base_label in ["referee", "ball"]:
+                print(f"→ YOLO only: {base_label}")
                 continue
 
             # PLAYER / GOALKEEPER
             role = base_label
             team = None
 
-            # -----------------------------
-            # TEAM CLASSIFIER DEBUG
-            # -----------------------------
             if classifier is not None:
                 crop = frame[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
 
@@ -117,22 +188,14 @@ def process_video(model, classifier, local_video, original_name):
                         team_detected = parse_team_classifier_label(raw_label)
                         print(f"Team detected: {team_detected}")
 
-                        if team_detected is None:
-                            print("⚠️ parse_team_classifier_label devolveu None")
-                        else:
-                            team = team_detected
+                        team = team_detected
 
-            # -----------------------------
-            # FINAL LABEL DEBUG
-            # -----------------------------
+            # FINAL LABEL
             if team == "A":
-                final_label = f"{role.capitalize()} Team A"
                 print("✔ FINAL: Team A")
             elif team == "B":
-                final_label = f"{role.capitalize()} Team B"
                 print("✔ FINAL: Team B")
             else:
-                final_label = role.capitalize()
                 print("❌ FINAL: YOLO fallback (sem equipa)")
 
         writer.write(frame)
@@ -146,3 +209,49 @@ def process_video(model, classifier, local_video, original_name):
     print("==============================\n")
 
     return output_path
+
+# =============================================================
+# MAIN
+# =============================================================
+
+def main():
+    print("🚀 Starting DEBUG pipeline...\n")
+
+    model_path = download_model(MODEL_URL, "best.pt")
+    model = YOLO(model_path)
+
+    classifier = None
+    if USE_TEAM_CLASSIFIER:
+        classifier_path = download_model(CLASSIFIER_URL, "bestclassifier.pt")
+        classifier = YOLO(classifier_path)
+        print("Classifier names:", classifier.names)
+
+    videos = list_incoming()
+    if not videos:
+        print("📭 No videos in incoming.\n")
+        return
+
+    for file in videos:
+        key = file["Key"]
+        json_key = key.replace(".mp4", ".json")
+
+        print("\n========================================")
+        print(f"🎬 DEBUGGING VIDEO: {key}")
+        print("========================================\n")
+
+        local_video, local_json = download_video_and_json(key)
+
+        print(f"🗑️ HARD DELETE incoming video: {key}")
+        hard_delete_file(key)
+
+        print(f"🗑️ HARD DELETE incoming JSON: {json_key}")
+        hard_delete_file(json_key)
+
+        safe_video = convert_video_to_safe_format(local_video)
+
+        debug_output = process_video_debug(model, classifier, safe_video, os.path.basename(key))
+
+        print(f"✔ DEBUG OUTPUT CREATED: {debug_output}\n")
+
+if __name__ == "__main__":
+    main()
