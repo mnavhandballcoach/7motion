@@ -21,7 +21,11 @@ def load_yolo_model():
     return YOLO(local_path)
 
 def load_team_classifier():
+    """
+    ⚠️ Este método agora só garante que o modelo PyTorch é descarregado.
+    Não devolve YOLO, porque o classificador PyTorch é carregado em core/classifier.py.
+    """
     local_path = "bestclassifier.pt"
     if not os.path.exists(local_path):
         download_file(CLASSIFIER_URL, local_path)
-    return YOLO(local_path)
+    return local_path
