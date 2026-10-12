@@ -13,10 +13,6 @@ from ultralytics import YOLO
 
 from api.b2_client import hard_delete_file
 
-# =============================================================
-# CONFIGURAÇÕES
-# =============================================================
-
 USE_TEAM_CLASSIFIER = True
 
 MODEL_URL = "https://github.com/mnavhandballcoach/7motion/releases/download/models/best.pt"
@@ -40,9 +36,9 @@ s3 = boto3.client(
     aws_secret_access_key=AWS_SECRET
 )
 
-# =============================================================
-# EMAIL
-# =============================================================
+# -------------------------------------------------------------
+# Email
+# -------------------------------------------------------------
 
 def send_email(user_email, user_name, video_url):
     if not user_email:
@@ -73,9 +69,9 @@ Obrigado por utilizar o nosso serviço!
     except Exception:
         pass
 
-# =============================================================
-# DOWNLOAD MODELOS
-# =============================================================
+# -------------------------------------------------------------
+# Download modelos
+# -------------------------------------------------------------
 
 def download_model(url, filename):
     r = requests.get(url)
@@ -84,9 +80,9 @@ def download_model(url, filename):
         f.write(r.content)
     return filename
 
-# =============================================================
-# LISTAR INCOMING
-# =============================================================
+# -------------------------------------------------------------
+# Incoming
+# -------------------------------------------------------------
 
 def list_incoming():
     resp = s3.list_objects_v2(Bucket=BUCKET_NAME, Prefix="incoming/")
@@ -95,9 +91,6 @@ def list_incoming():
     videos = [f for f in files if f["Key"].lower().endswith(video_exts)]
     return files, videos
 
-# =============================================================
-# DOWNLOAD VÍDEO + JSON
-# =============================================================
 
 def download_video_and_json(key):
     local_video = "input.mp4"
@@ -118,36 +111,35 @@ def download_video_and_json(key):
 
     return local_video, local_json
 
-# =============================================================
-# CORTAR VÍDEO
-# =============================================================
+# -------------------------------------------------------------
+# FFmpeg helpers
+# -------------------------------------------------------------
 
 def cut_video(input_path, start_time, duration):
     output_path = "cut_input.mp4"
-    cmd = ["ffmpeg", "-y", "-ss", str(start_time), "-i", input_path, "-t", str(duration), "-c", "copy", output_path]
+    cmd = ["ffmpeg", "-y", "-ss", str(start_time), "-i", input_path,
+           "-t", str(duration), "-c", "copy", output_path]
     subprocess.run(cmd, check=True)
     return output_path
 
-# =============================================================
-# CONVERTER VÍDEO
-# =============================================================
 
 def convert_video_to_safe_format(input_path):
     safe_path = "safe_input.mp4"
-    cmd = ["ffmpeg", "-y", "-i", input_path, "-movflags", "faststart", "-pix_fmt", "yuv420p", safe_path]
+    cmd = ["ffmpeg", "-y", "-i", input_path,
+           "-movflags", "faststart", "-pix_fmt", "yuv420p", safe_path]
     subprocess.run(cmd, check=True)
     return safe_path
 
-# =============================================================
-# UPLOAD
-# =============================================================
+# -------------------------------------------------------------
+# Upload
+# -------------------------------------------------------------
 
 def upload_file(local_path, remote_name):
     s3.upload_file(local_path, BUCKET_NAME, remote_name)
 
-# =============================================================
-# DESENHO
-# =============================================================
+# -------------------------------------------------------------
+# Drawing
+# -------------------------------------------------------------
 
 COLOR_PLAYER_YOLO = (180, 80, 80)
 COLOR_GOALKEEPER_YOLO = (120, 220, 120)
@@ -157,14 +149,19 @@ COLOR_BALL = (255, 255, 0)
 COLOR_TEAM_A = (0, 0, 255)
 COLOR_TEAM_B = (0, 255, 0)
 
+
 def draw_triangle(frame, x, y, color):
     pts = np.array([[x, y], [x - 14, y - 22], [x + 14, y - 22]], np.int32)
     cv2.polylines(frame, [pts], True, (0, 0, 0), 2)
     cv2.fillPoly(frame, [pts], color)
 
+
 def draw_label(frame, x, y, label):
-    cv2.putText(frame, label, (x - 35, y - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 3)
-    cv2.putText(frame, label, (x - 35, y - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
+    cv2.putText(frame, label, (x - 35, y - 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 3)
+    cv2.putText(frame, label, (x - 35, y - 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
+
 
 def draw_ball(frame, x, y, w, h):
     radius = int(max(w, h) / 2)
@@ -173,23 +170,23 @@ def draw_ball(frame, x, y, w, h):
     cv2.circle(frame, (cx, cy), radius, (0, 0, 0), 3)
     cv2.circle(frame, (cx, cy), radius, COLOR_BALL, 2)
 
-# =============================================================
-# INTERPRETAR LABEL DO TEAM CLASSIFIER
-# =============================================================
+# -------------------------------------------------------------
+# Team classifier parsing
+# -------------------------------------------------------------
 
 def parse_team_classifier_label(label_str):
     label_str = label_str.strip().lower()
 
     if "team a" in label_str:
-        return "player_or_goalkeeper", "A"
+        return "A"
     if "team b" in label_str:
-        return "player_or_goalkeeper", "B"
+        return "B"
 
-    return None, None
+    return None
 
-# =============================================================
-# PROCESSAMENTO DO VÍDEO
-# =============================================================
+# -------------------------------------------------------------
+# Core processing
+# -------------------------------------------------------------
 
 def process_video(model, classifier, local_video, original_name):
     cap = cv2.VideoCapture(local_video)
@@ -220,10 +217,6 @@ def process_video(model, classifier, local_video, original_name):
     )
 
     frame_index = 0
-    team_memory = {}
-
-    CONF_THRESHOLD = 0.4
-    EMA_ALPHA = 0.3
 
     while True:
         ret, frame = cap.read()
@@ -249,28 +242,23 @@ def process_video(model, classifier, local_video, original_name):
             final_label = base_label
             color = None
 
-            # =============================================================
-            # ÁRBITRO
-            # =============================================================
+            # Referee
             if base_label == "referee":
                 draw_triangle(frame, x1 + w_box // 2, y1, COLOR_REFEREE)
                 final_label = "Referee"
                 color = COLOR_REFEREE
                 draw_label(frame, x1 + w_box // 2, y1, final_label)
 
-            # =============================================================
-            # BOLA
-            # =============================================================
+            # Ball
             elif base_label == "ball":
                 draw_ball(frame, x1, y1, w_box, h_box)
                 final_label = "Ball"
                 color = COLOR_BALL
 
-            # =============================================================
-            # PLAYER / GOALKEEPER
-            # =============================================================
+            # Player / Goalkeeper
             else:
-                role = base_label
+                role = base_label  # "player" ou "goalkeeper"
+                team = None
 
                 if USE_TEAM_CLASSIFIER and classifier is not None:
                     crop = frame[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
@@ -279,21 +267,13 @@ def process_video(model, classifier, local_video, original_name):
                         cls_results = classifier.predict(crop, verbose=False)
                         cls_boxes = cls_results[0].boxes
 
-                        if cls_boxes is None or len(cls_boxes) == 0:
-                            team = None
-                        else:
+                        if cls_boxes is not None and len(cls_boxes) > 0:
                             cbox = cls_boxes[0]
                             ccls = int(cbox.cls[0])
                             raw_label = classifier.names[ccls]
-                            _, team = parse_team_classifier_label(raw_label)
-                    else:
-                        team = None
-                else:
-                    team = None
+                            team = parse_team_classifier_label(raw_label)
 
-                # =============================================================
-                # COMBINAR YOLO + TEAM CLASSIFIER
-                # =============================================================
+                # Combinar YOLO + TeamClassifier
                 if team == "A":
                     final_label = f"{role.capitalize()} Team A"
                     color = COLOR_TEAM_A
@@ -311,7 +291,9 @@ def process_video(model, classifier, local_video, original_name):
                 draw_triangle(frame, x1 + w_box // 2, y1, color)
                 draw_label(frame, x1 + w_box // 2, y1, final_label)
 
-            labels_file.write(f"{frame_name} {final_label} - {x1} {y1} {x2} {y2}\n")
+            labels_file.write(
+                f"{frame_name} {final_label} - {x1} {y1} {x2} {y2}\n"
+            )
 
         cv2.imwrite(frame_path, frame)
         writer.write(frame)
@@ -323,11 +305,13 @@ def process_video(model, classifier, local_video, original_name):
 
     return output_video, frames_dir, labels_path
 
-# =============================================================
-# MAIN
-# =============================================================
+# -------------------------------------------------------------
+# Main
+# -------------------------------------------------------------
 
 def main():
+    print(">>> USING process_video v2 (Team A / Team B) <<<")
+
     model_path = download_model(MODEL_URL, "best.pt")
     model = YOLO(model_path)
 
@@ -335,9 +319,11 @@ def main():
     if USE_TEAM_CLASSIFIER:
         classifier_path = download_model(CLASSIFIER_URL, "bestclassifier.pt")
         classifier = YOLO(classifier_path)
+        print("Classifier names:", classifier.names)
 
     files_all, files_videos = list_incoming()
     if not files_videos:
+        print("No videos in incoming/.")
         return
 
     for file in files_videos:
