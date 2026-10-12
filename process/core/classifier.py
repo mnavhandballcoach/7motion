@@ -35,8 +35,8 @@ class TeamClassifier:
         return self.classes[pred]
 
 
-# Load model from GitHub release
-team_model = TeamClassifier("models/bestclassifier.pt")
+# Load model downloaded by core/models.py
+team_model = TeamClassifier("bestclassifier.pt")
 
 
 def classify_team(crop):
