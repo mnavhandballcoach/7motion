@@ -1,7 +1,7 @@
 # ============================
 # Team Classifier Toggle
 # ============================
-USE_TEAM_CLASSIFIER = False  # agora ativo
+USE_TEAM_CLASSIFIER = True  # agora ativo
 
 import sys
 import os
