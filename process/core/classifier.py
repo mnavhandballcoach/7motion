@@ -32,7 +32,14 @@ class TeamClassifier:
             output = self.model(tensor)
             pred = output.argmax(dim=1).cpu().item()
 
-        return self.classes[pred]
+        raw = self.classes[pred]
+
+        # Convert to EMA-friendly labels
+        if raw == "Team A":
+            return "A"
+        if raw == "Team B":
+            return "B"
+        return None
 
 
 # Load model downloaded by core/models.py
