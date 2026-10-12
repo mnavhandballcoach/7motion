@@ -14,10 +14,11 @@ from ultralytics import YOLO
 from api.b2_client import hard_delete_file  # <- função que adicionaste ao b2_client.py
 
 print("\n==============================")
-print("   PROCESS VIDEO PIPELINE v10")
+print("   PROCESS VIDEO PIPELINE v11")
 print("==============================\n")
 
-USE_TEAM_CLASSIFIER = False
+# Toggle para activar/desactivar o TeamClassifier
+USE_TEAM_CLASSIFIER = True
 
 MODEL_URL = "https://github.com/mnavhandballcoach/7motion/releases/download/models/best.pt"
 CLASSIFIER_URL = "https://github.com/mnavhandballcoach/7motion/releases/download/models/bestclassifier.pt"
@@ -151,6 +152,9 @@ COLOR_GOALKEEPER_YOLO = (120, 220, 120)
 COLOR_REFEREE = (200, 200, 200)
 COLOR_BALL = (255, 255, 0)
 
+COLOR_TEAM_A = (0, 0, 255)   # azul/vermelho à tua escolha
+COLOR_TEAM_B = (0, 255, 0)
+
 def draw_triangle(frame, x, y, color):
     pts = np.array([[x, y], [x - 14, y - 22], [x + 14, y - 22]], np.int32)
     cv2.polylines(frame, [pts], True, (0, 0, 0), 2)
@@ -170,8 +174,33 @@ def draw_ball(frame, x, y, w, h):
     cv2.circle(frame, (cx, cy), radius, COLOR_BALL, 2)
 
 
+def parse_team_classifier_label(label_str):
+    """
+    Exemplo de labels:
+    - "Player Team A"
+    - "Player Team B"
+    - "Goalkeeper Team A"
+    - "Goalkeeper Team B"
+    """
+    label_str = label_str.strip().lower()
+    team = None
+    role = None
+
+    if "team a" in label_str:
+        team = "A"
+    elif "team b" in label_str:
+        team = "B"
+
+    if "player" in label_str:
+        role = "player"
+    elif "goalkeeper" in label_str:
+        role = "goalkeeper"
+
+    return role, team
+
+
 def process_video(model, classifier, local_video, original_name):
-    print(f"🔍 Running YOLO on {local_video}...")
+    print(f"🔍 Running YOLO (tracking) on {local_video}...")
 
     cap = cv2.VideoCapture(local_video)
     if not cap.isOpened():
@@ -205,12 +234,20 @@ def process_video(model, classifier, local_video, original_name):
 
     frame_index = 0
 
+    # Memória por track_id para estabilidade de equipa
+    team_memory = {}  # track_id -> {"team": "A"/"B", "role": "player"/"goalkeeper", "confidence": float}
+
+    # Parâmetros de suavização
+    CONF_THRESHOLD = 0.4
+    EMA_ALPHA = 0.3
+
     while True:
         ret, frame = cap.read()
         if not ret:
             break
 
-        results = model(frame)
+        # Tracking em vez de simples deteção
+        results = model.track(frame, persist=True)
         detections = results[0].boxes
 
         frame_name = f"frame_{frame_index:05d}.jpg"
@@ -218,26 +255,143 @@ def process_video(model, classifier, local_video, original_name):
 
         for box in detections:
             cls = int(box.cls[0])
-            label = model.names[cls].lower()
+            base_label = model.names[cls].lower()
 
             x1, y1, x2, y2 = map(int, box.xyxy[0])
             w_box = x2 - x1
             h_box = y2 - y1
 
-            if label == "player":
-                draw_triangle(frame, x1 + w_box // 2, y1, COLOR_PLAYER_YOLO)
-                draw_label(frame, x1 + w_box // 2, y1, "Player")
-            elif label == "goalkeeper":
-                draw_triangle(frame, x1 + w_box // 2, y1, COLOR_GOALKEEPER_YOLO)
-                draw_label(frame, x1 + w_box // 2, y1, "Goalkeeper")
-            elif label == "referee":
-                draw_triangle(frame, x1 + w_box // 2, y1, COLOR_REFEREE)
-                draw_label(frame, x1 + w_box // 2, y1, "Referee")
-            elif label == "ball":
+            track_id = None
+            if box.id is not None:
+                track_id = int(box.id[0])
+
+            final_label = base_label
+            color = None
+
+            # Bola e árbitro não usam team classifier
+            if base_label == "ball":
                 draw_ball(frame, x1, y1, w_box, h_box)
+                final_label = "Ball"
+                color = COLOR_BALL
+
+            elif base_label == "referee":
+                draw_triangle(frame, x1 + w_box // 2, y1, COLOR_REFEREE)
+                final_label = "Referee"
+                color = COLOR_REFEREE
+
+            else:
+                # player / goalkeeper
+                if USE_TEAM_CLASSIFIER and classifier is not None and track_id is not None:
+                    # Crop do jogador/guarda-redes
+                    crop = frame[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
+                    if crop.size > 0:
+                        cls_results = classifier.predict(crop, verbose=False)
+                        cls_boxes = cls_results[0].boxes
+                        if len(cls_boxes) > 0:
+                            # Assume a box principal
+                            cbox = cls_boxes[0]
+                            ccls = int(cbox.cls[0])
+                            raw_label = classifier.names[ccls]
+                            role, team = parse_team_classifier_label(raw_label)
+
+                            conf = float(cbox.conf[0]) if cbox.conf is not None else 1.0
+
+                            if role in ("player", "goalkeeper") and team in ("A", "B"):
+                                # Atualizar memória com EMA de confiança
+                                prev = team_memory.get(track_id)
+                                if prev is None:
+                                    team_memory[track_id] = {
+                                        "team": team,
+                                        "role": role,
+                                        "confidence": conf
+                                    }
+                                else:
+                                    # Se mesma equipa, suavizar confiança
+                                    if prev["team"] == team:
+                                        new_conf = EMA_ALPHA * conf + (1 - EMA_ALPHA) * prev["confidence"]
+                                        team_memory[track_id]["confidence"] = new_conf
+                                    else:
+                                        # Só muda de equipa se confiança nova for claramente maior
+                                        if conf > prev["confidence"] + 0.2:
+                                            team_memory[track_id] = {
+                                                "team": team,
+                                                "role": role,
+                                                "confidence": conf
+                                            }
+
+                                mem = team_memory[track_id]
+                                if mem["confidence"] >= CONF_THRESHOLD:
+                                    # Label final estável
+                                    if mem["role"] == "player":
+                                        if mem["team"] == "A":
+                                            final_label = "Player Team A"
+                                            color = COLOR_TEAM_A
+                                        else:
+                                            final_label = "Player Team B"
+                                            color = COLOR_TEAM_B
+                                    elif mem["role"] == "goalkeeper":
+                                        if mem["team"] == "A":
+                                            final_label = "Goalkeeper Team A"
+                                            color = COLOR_TEAM_A
+                                        else:
+                                            final_label = "Goalkeeper Team B"
+                                            color = COLOR_TEAM_B
+                                else:
+                                    # Confiança baixa → fallback para YOLO base
+                                    if base_label == "player":
+                                        final_label = "Player"
+                                        color = COLOR_PLAYER_YOLO
+                                    elif base_label == "goalkeeper":
+                                        final_label = "Goalkeeper"
+                                        color = COLOR_GOALKEEPER_YOLO
+                            else:
+                                # Se o classificador não devolver algo válido, fallback
+                                if base_label == "player":
+                                    final_label = "Player"
+                                    color = COLOR_PLAYER_YOLO
+                                elif base_label == "goalkeeper":
+                                    final_label = "Goalkeeper"
+                                    color = COLOR_GOALKEEPER_YOLO
+                        else:
+                            # Sem boxes do classificador → fallback
+                            if base_label == "player":
+                                final_label = "Player"
+                                color = COLOR_PLAYER_YOLO
+                            elif base_label == "goalkeeper":
+                                final_label = "Goalkeeper"
+                                color = COLOR_GOALKEEPER_YOLO
+                    else:
+                        # Crop vazio → fallback
+                        if base_label == "player":
+                            final_label = "Player"
+                            color = COLOR_PLAYER_YOLO
+                        elif base_label == "goalkeeper":
+                            final_label = "Goalkeeper"
+                            color = COLOR_GOALKEEPER_YOLO
+                else:
+                    # Team classifier desligado → comportamento original
+                    if base_label == "player":
+                        final_label = "Player"
+                        color = COLOR_PLAYER_YOLO
+                    elif base_label == "goalkeeper":
+                        final_label = "Goalkeeper"
+                        color = COLOR_GOALKEEPER_YOLO
+
+                # Desenho para player/goalkeeper
+                if color is None:
+                    # fallback de cor
+                    if base_label == "player":
+                        color = COLOR_PLAYER_YOLO
+                    elif base_label == "goalkeeper":
+                        color = COLOR_GOALKEEPER_YOLO
+                    else:
+                        color = (255, 255, 255)
+
+                draw_triangle(frame, x1 + w_box // 2, y1, color)
+                draw_label(frame, x1 + w_box // 2, y1, final_label)
 
             labels_file.write(
-                f"{frame_name} {label} - {x1} {y1} {x2} {y2}\n"
+                f"{frame_name} {final_label} - {x1} {y1} {x2} {y2}\n"
             )
 
         cv2.imwrite(frame_path, frame)
