@@ -1,7 +1,7 @@
 # ============================
 # Team Classifier Toggle
 # ============================
-USE_TEAM_CLASSIFIER = True
+USE_TEAM_CLASSIFIER = False # TRUE or FALSE
 
 import sys
 import os
