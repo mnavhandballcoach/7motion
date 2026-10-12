@@ -13,6 +13,10 @@ from ultralytics import YOLO
 
 from api.b2_client import hard_delete_file
 
+print("\n==============================")
+print("   PROCESS VIDEO PIPELINE v10 + TEAM CLASSIFIER FIX")
+print("==============================\n")
+
 USE_TEAM_CLASSIFIER = True
 
 MODEL_URL = "https://github.com/mnavhandballcoach/7motion/releases/download/models/best.pt"
@@ -185,10 +189,12 @@ def parse_team_classifier_label(label_str):
     return None
 
 # -------------------------------------------------------------
-# Core processing
+# Core processing (based on v10 + classifier)
 # -------------------------------------------------------------
 
 def process_video(model, classifier, local_video, original_name):
+    print(f"🔍 Running YOLO + TeamClassifier on {local_video}...")
+
     cap = cv2.VideoCapture(local_video)
     fps = cap.get(cv2.CAP_PROP_FPS)
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -218,12 +224,17 @@ def process_video(model, classifier, local_video, original_name):
 
     frame_index = 0
 
+    # memória por track_id para suavização
+    team_memory = {}
+    EMA_ALPHA = 0.25
+    CONF_THRESHOLD = 0.40
+
     while True:
         ret, frame = cap.read()
         if not ret:
             break
 
-        results = model.track(frame, persist=True)
+        results = model(frame)
         detections = results[0].boxes
 
         frame_name = f"frame_{frame_index:05d}.jpg"
@@ -239,61 +250,89 @@ def process_video(model, classifier, local_video, original_name):
 
             track_id = int(box.id[0]) if box.id is not None else None
 
-            final_label = base_label
-            color = None
-
-            # Referee
+            # -------------------------------------------------------------
+            # Árbitro
+            # -------------------------------------------------------------
             if base_label == "referee":
                 draw_triangle(frame, x1 + w_box // 2, y1, COLOR_REFEREE)
-                final_label = "Referee"
-                color = COLOR_REFEREE
-                draw_label(frame, x1 + w_box // 2, y1, final_label)
+                draw_label(frame, x1 + w_box // 2, y1, "Referee")
+                labels_file.write(f"{frame_name} referee - {x1} {y1} {x2} {y2}\n")
+                continue
 
-            # Ball
-            elif base_label == "ball":
+            # -------------------------------------------------------------
+            # Bola
+            # -------------------------------------------------------------
+            if base_label == "ball":
                 draw_ball(frame, x1, y1, w_box, h_box)
-                final_label = "Ball"
-                color = COLOR_BALL
+                labels_file.write(f"{frame_name} ball - {x1} {y1} {x2} {y2}\n")
+                continue
 
+            # -------------------------------------------------------------
             # Player / Goalkeeper
+            # -------------------------------------------------------------
+            role = base_label
+            team = None
+
+            if USE_TEAM_CLASSIFIER and classifier is not None:
+                crop = frame[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
+
+                if crop.size > 0:
+                    cls_results = classifier.predict(crop, verbose=False)
+                    cls_boxes = cls_results[0].boxes
+
+                    if cls_boxes is not None and len(cls_boxes) > 0:
+                        cbox = cls_boxes[0]
+                        ccls = int(cbox.cls[0])
+                        raw_label = classifier.names[ccls]
+                        team_detected = parse_team_classifier_label(raw_label)
+                        conf = float(cbox.conf[0]) if cbox.conf is not None else 1.0
+
+                        if track_id is not None:
+                            prev = team_memory.get(track_id)
+
+                            if prev is None:
+                                team_memory[track_id] = {
+                                    "team": team_detected,
+                                    "confidence": conf
+                                }
+                            else:
+                                if prev["team"] == team_detected:
+                                    new_conf = EMA_ALPHA * conf + (1 - EMA_ALPHA) * prev["confidence"]
+                                    team_memory[track_id]["confidence"] = new_conf
+                                else:
+                                    if conf > prev["confidence"] + 0.25:
+                                        team_memory[track_id] = {
+                                            "team": team_detected,
+                                            "confidence": conf
+                                        }
+
+                            mem = team_memory[track_id]
+                            if mem["confidence"] >= CONF_THRESHOLD:
+                                team = mem["team"]
+                        else:
+                            team = team_detected
+
+            # -------------------------------------------------------------
+            # Combinar YOLO + TeamClassifier
+            # -------------------------------------------------------------
+            if team == "A":
+                final_label = f"{role.capitalize()} Team A"
+                color = COLOR_TEAM_A
+            elif team == "B":
+                final_label = f"{role.capitalize()} Team B"
+                color = COLOR_TEAM_B
             else:
-                role = base_label  # "player" ou "goalkeeper"
-                team = None
-
-                if USE_TEAM_CLASSIFIER and classifier is not None:
-                    crop = frame[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
-
-                    if crop.size > 0:
-                        cls_results = classifier.predict(crop, verbose=False)
-                        cls_boxes = cls_results[0].boxes
-
-                        if cls_boxes is not None and len(cls_boxes) > 0:
-                            cbox = cls_boxes[0]
-                            ccls = int(cbox.cls[0])
-                            raw_label = classifier.names[ccls]
-                            team = parse_team_classifier_label(raw_label)
-
-                # Combinar YOLO + TeamClassifier
-                if team == "A":
-                    final_label = f"{role.capitalize()} Team A"
-                    color = COLOR_TEAM_A
-                elif team == "B":
-                    final_label = f"{role.capitalize()} Team B"
-                    color = COLOR_TEAM_B
+                if role == "player":
+                    final_label = "Player"
+                    color = COLOR_PLAYER_YOLO
                 else:
-                    if role == "player":
-                        final_label = "Player"
-                        color = COLOR_PLAYER_YOLO
-                    else:
-                        final_label = "Goalkeeper"
-                        color = COLOR_GOALKEEPER_YOLO
+                    final_label = "Goalkeeper"
+                    color = COLOR_GOALKEEPER_YOLO
 
-                draw_triangle(frame, x1 + w_box // 2, y1, color)
-                draw_label(frame, x1 + w_box // 2, y1, final_label)
+            draw_triangle(frame, x1 + w_box // 2, y1, color)
+            draw_label(frame, x1 + w_box // 2, y1, final_label)
 
-            labels_file.write(
-                f"{frame_name} {final_label} - {x1} {y1} {x2} {y2}\n"
-            )
+            labels_file.write(f"{frame_name} {final_label} - {x1} {y1} {x2} {y2}\n")
 
         cv2.imwrite(frame_path, frame)
         writer.write(frame)
@@ -303,6 +342,10 @@ def process_video(model, classifier, local_video, original_name):
     writer.release()
     labels_file.close()
 
+    print(f"✔ Annotated video created: {output_video}")
+    print(f"✔ Frames saved in: {frames_dir}")
+    print(f"✔ Labels saved in: {labels_path}\n")
+
     return output_video, frames_dir, labels_path
 
 # -------------------------------------------------------------
@@ -310,7 +353,7 @@ def process_video(model, classifier, local_video, original_name):
 # -------------------------------------------------------------
 
 def main():
-    print(">>> USING process_video v2 (Team A / Team B) <<<")
+    print(">>> USING process_video v10 + TEAM CLASSIFIER FIX <<<")
 
     model_path = download_model(MODEL_URL, "best.pt")
     model = YOLO(model_path)
