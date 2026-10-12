@@ -8,7 +8,8 @@ SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))
 SMTP_USER = os.getenv("SMTP_USER")
 SMTP_PASS = os.getenv("SMTP_PASS")
 
-def send_email(user_email, user_name, video_url):
+
+def send_email(user_email, user_name, page_url):
     if not user_email:
         return
 
@@ -18,8 +19,8 @@ Olá {user_name or "Utilizador"},
 
 O seu vídeo foi processado com sucesso.
 
-Pode descarregar o vídeo anotado aqui:
-{video_url}
+Pode vê-lo aqui:
+{page_url}
 
 Obrigado por utilizar o nosso serviço!
 """
