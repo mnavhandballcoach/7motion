@@ -14,7 +14,7 @@ from ultralytics import YOLO
 from api.b2_client import hard_delete_file
 
 print("\n==============================")
-print("   PROCESS VIDEO PIPELINE v10 (IMAGE CLASSIFIER FIX)")
+print("   PROCESS VIDEO PIPELINE v10 + EMA")
 print("==============================\n")
 
 USE_TEAM_CLASSIFIER = True
@@ -189,11 +189,11 @@ def parse_team_classifier_label(label_str):
     return None
 
 # -------------------------------------------------------------
-# Core processing (v10 + image classifier)
+# Core processing (v10 + image classifier + EMA)
 # -------------------------------------------------------------
 
 def process_video(model, classifier, local_video, original_name):
-    print(f"🔍 Running YOLO + IMAGE CLASSIFIER on {local_video}...")
+    print(f"🔍 Running YOLO + IMAGE CLASSIFIER + EMA on {local_video}...")
 
     cap = cv2.VideoCapture(local_video)
     fps = cap.get(cv2.CAP_PROP_FPS)
@@ -224,6 +224,10 @@ def process_video(model, classifier, local_video, original_name):
 
     frame_index = 0
 
+    # EMA memory
+    team_memory = {}
+    EMA_ALPHA = 0.25
+
     while True:
         ret, frame = cap.read()
         if not ret:
@@ -243,44 +247,62 @@ def process_video(model, classifier, local_video, original_name):
             w_box = x2 - x1
             h_box = y2 - y1
 
-            # -------------------------------------------------------------
+            track_id = int(box.id[0]) if box.id is not None else None
+
             # Árbitro
-            # -------------------------------------------------------------
             if base_label == "referee":
                 draw_triangle(frame, x1 + w_box // 2, y1, COLOR_REFEREE)
                 draw_label(frame, x1 + w_box // 2, y1, "Referee")
                 labels_file.write(f"{frame_name} referee - {x1} {y1} {x2} {y2}\n")
                 continue
 
-            # -------------------------------------------------------------
             # Bola
-            # -------------------------------------------------------------
             if base_label == "ball":
                 draw_ball(frame, x1, y1, w_box, h_box)
                 labels_file.write(f"{frame_name} ball - {x1} {y1} {x2} {y2}\n")
                 continue
 
-            # -------------------------------------------------------------
             # Player / Goalkeeper
-            # -------------------------------------------------------------
             role = base_label
-            team = None
+            team_raw = None
 
+            # Inicializar memória EMA
+            if track_id is not None and track_id not in team_memory:
+                team_memory[track_id] = 0.5
+
+            # Classificação de imagem
             if USE_TEAM_CLASSIFIER and classifier is not None:
                 crop = frame[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
-
                 if crop.size > 0:
-                    # CLASSIFICAÇÃO DE IMAGEM (não YOLO-detector)
                     cls_results = classifier(crop)
-
                     team_idx = int(cls_results[0].probs.top1)
                     raw_label = classifier.names[team_idx]
+                    team_raw = parse_team_classifier_label(raw_label)
 
-                    team = parse_team_classifier_label(raw_label)
+            # Converter para valor numérico
+            if team_raw == "A":
+                numeric = 1.0
+            elif team_raw == "B":
+                numeric = 0.0
+            else:
+                numeric = None
 
-            # -------------------------------------------------------------
+            # Aplicar EMA
+            if track_id is not None:
+                if numeric is not None:
+                    team_memory[track_id] = EMA_ALPHA * numeric + (1 - EMA_ALPHA) * team_memory[track_id]
+
+                # Decisão final
+                if team_memory[track_id] > 0.6:
+                    team = "A"
+                elif team_memory[track_id] < 0.4:
+                    team = "B"
+                else:
+                    team = None
+            else:
+                team = team_raw
+
             # Combinar YOLO + TeamClassifier
-            # -------------------------------------------------------------
             if team == "A":
                 final_label = f"{role.capitalize()} Team A"
                 color = COLOR_TEAM_A
@@ -315,7 +337,7 @@ def process_video(model, classifier, local_video, original_name):
 # -------------------------------------------------------------
 
 def main():
-    print(">>> USING process_video v10 (IMAGE CLASSIFIER FIX) <<<")
+    print(">>> USING process_video v10 + EMA <<<")
 
     model_path = download_model(MODEL_URL, "best.pt")
     model = YOLO(model_path)
