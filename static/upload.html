@@ -6,6 +6,17 @@
     <style>
         body { font-family: Arial; margin: 40px; }
         input, button { margin: 10px 0; padding: 8px; width: 300px; }
+        #progressBar {
+            width: 300px;
+            height: 20px;
+            background: #ddd;
+            margin-top: 15px;
+        }
+        #progressFill {
+            height: 100%;
+            width: 0%;
+            background: #4caf50;
+        }
     </style>
 </head>
 <body>
@@ -28,6 +39,8 @@
 <input type="file" id="video" accept="video/*" required><br>
 
 <button onclick="uploadVideo()">Upload Video</button>
+
+<div id="progressBar"><div id="progressFill"></div></div>
 
 <p id="status"></p>
 
@@ -87,11 +100,15 @@ async function uploadVideo() {
         });
 
         if (!response.ok) {
-            document.getElementById("status").innerText = "❌ Network error during upload.";
+            document.getElementById("status").innerText = "❌ Upload error.";
             return;
         }
 
         offset += chunkSize;
+
+        const percent = Math.min(offset / file.size * 100, 100);
+        document.getElementById("progressFill").style.width = percent + "%";
+
         document.getElementById("status").innerText =
             `Uploaded: ${Math.min(offset, file.size)} / ${file.size} bytes`;
     }
