@@ -14,7 +14,7 @@ import requests
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from process.core.models import load_yolo_model
+from process.core.models import load_yolo_model, load_team_classifier
 from process.core.cropper import crop_with_pad, is_box_too_small
 from process.core.classifier import classify_team
 from process.core.ema import init_track_memory, update_ema, decide_team
@@ -154,6 +154,10 @@ def main():
     print(">>> USING process_video — engine profissional <<<")
 
     model = load_yolo_model()
+
+    # 🔥 GARANTE DOWNLOAD DO MODELO PYTORCH
+    if USE_TEAM_CLASSIFIER:
+        load_team_classifier()
 
     files_all, files_videos = list_incoming()
     if not files_videos:
