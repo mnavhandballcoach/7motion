@@ -14,7 +14,7 @@ from ultralytics import YOLO
 from api.b2_client import hard_delete_file
 
 print("\n==============================")
-print("   PROCESS VIDEO PIPELINE v12")
+print("   PROCESS VIDEO PIPELINE v13")
 print("==============================\n")
 
 USE_TEAM_CLASSIFIER = True
@@ -273,6 +273,7 @@ def process_video(model, classifier, local_video, original_name):
                         cls_results = classifier.predict(crop, verbose=False)
                         cls_boxes = cls_results[0].boxes
 
+                        # PATCH: nunca sair antes de desenhar
                         if cls_boxes is None or len(cls_boxes) == 0:
                             if base_label == "player":
                                 final_label = "Player"
@@ -280,6 +281,13 @@ def process_video(model, classifier, local_video, original_name):
                             else:
                                 final_label = "Goalkeeper"
                                 color = COLOR_GOALKEEPER_YOLO
+
+                            draw_triangle(frame, x1 + w_box // 2, y1, color)
+                            draw_label(frame, x1 + w_box // 2, y1, final_label)
+
+                            labels_file.write(
+                                f"{frame_name} {final_label} - {x1} {y1} {x2} {y2}\n"
+                            )
                             continue
 
                         cbox = cls_boxes[0]
