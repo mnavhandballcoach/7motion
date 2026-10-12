@@ -16,7 +16,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from process.core.models import load_yolo_model, load_team_classifier
 from process.core.cropper import crop_with_pad, is_box_too_small
-from process.core.classifier import classify_team, TeamClassifier
+from process.core.classifier import TeamClassifier   # <-- REMOVIDO classify_team
 from process.core.ema import init_track_memory, update_ema, decide_team
 from process.core.fallback import apply_fallback
 from process.core.drawer import draw_entity
@@ -119,7 +119,8 @@ def process_video(model, classifier, local_video, original_name):
                 crop, _ = crop_with_pad(frame, x1, y1, x2, y2, w, h)
 
                 if USE_TEAM_CLASSIFIER:
-                    team_raw = classify_team(crop, classifier)
+                    # YOLO classification batch
+                    team_raw = classifier.predict_batch([crop])[0]
                 else:
                     team_raw = None
 
@@ -159,7 +160,7 @@ def main():
     classifier = None
     if USE_TEAM_CLASSIFIER:
         load_team_classifier()  # descarrega bestclassifier.pt
-        classifier = TeamClassifier("bestclassifier.pt")  # carrega PyTorch
+        classifier = TeamClassifier("bestclassifier.pt")  # carrega YOLO classifier
 
     files_all, files_videos = list_incoming()
     if not files_videos:
