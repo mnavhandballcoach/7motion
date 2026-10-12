@@ -3,6 +3,11 @@ import torchvision.transforms as transforms
 from PIL import Image
 from .utils import laplacian_variance
 
+# 🔥 PyTorch 2.6 fix — permitir a classe usada no checkpoint YOLO
+from torch.serialization import add_safe_globals
+import ultralytics.nn.tasks as ul_tasks
+add_safe_globals([ul_tasks.ClassificationModel])
+
 IMG_SIZE = 224
 
 class TeamClassifier:
@@ -10,7 +15,8 @@ class TeamClassifier:
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         print("[TeamClassifier] Using device:", self.device)
 
-        self.model = torch.load(model_path, map_location=self.device)
+        # Agora funciona no PyTorch 2.6
+        self.model = torch.load(model_path, map_location=self.device, weights_only=False)
         self.model.to(self.device)
         self.model.eval()
 
