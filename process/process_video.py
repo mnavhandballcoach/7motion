@@ -287,14 +287,19 @@ def process_video(model, classifier, local_video, original_name):
                     if crop.size > 0:
                         cls_results = classifier.predict(crop, verbose=False)
                         cls_boxes = cls_results[0].boxes
-                        if len(cls_boxes) > 0:
-                            # Assume a box principal
-                            cbox = cls_boxes[0]
-                            ccls = int(cbox.cls[0])
-                            raw_label = classifier.names[ccls]
-                            role, team = parse_team_classifier_label(raw_label)
+                            # Proteção contra None
+                            if cls_boxes is None or len(cls_boxes) == 0:
+                                # fallback para YOLO
+                                if base_label == "player":
+                                    final_label = "Player"
+                                    color = COLOR_PLAYER_YOLO
+                                elif base_label == "goalkeeper":
+                                    final_label = "Goalkeeper"
+                                    color = COLOR_GOALKEEPER_YOLO
+                            
+                                # continuar para o próximo box
+                                continue
 
-                            conf = float(cbox.conf[0]) if cbox.conf is not None else 1.0
 
                             if role in ("player", "goalkeeper") and team in ("A", "B"):
                                 # Atualizar memória com EMA de confiança
