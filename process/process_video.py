@@ -1,27 +1,3 @@
-process_video.py — versão final corrigida
-
-Esta versão está 100% compatível com o teu modelo:
-
-YOLO → Player / Goalkeeper / Referee / Ball
-
-TeamClassifier → "Team A" ou "Team B"
-
-Combinação correta → Player Team A/B, Goalkeeper Team A/B
-
-Cores corretas
-
-Suavização EMA
-
-Anti‑oscillation
-
-Fallback seguro
-
-Árbitros com texto
-
-Sem desaparecimento de jogadores
-
-Sem dependência obrigatória de track_id
-
 import os
 import cv2
 import shutil
