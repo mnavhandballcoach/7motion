@@ -1,7 +1,7 @@
 # ============================
 # Team Classifier Toggle
 # ============================
-USE_TEAM_CLASSIFIER = True  # agora ativo
+USE_TEAM_CLASSIFIER = True  # ativa o classificador
 
 import sys
 import os
@@ -16,7 +16,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from process.core.models import load_yolo_model, load_team_classifier
 from process.core.cropper import crop_with_pad, is_box_too_small
-from process.core.classifier import TeamClassifier   # <-- REMOVIDO classify_team
+from process.core.classifier import TeamClassifier   # <-- só isto
 from process.core.ema import init_track_memory, update_ema, decide_team
 from process.core.fallback import apply_fallback
 from process.core.drawer import draw_entity
@@ -64,6 +64,9 @@ def process_video(model, classifier, local_video, original_name):
     last_team = {}
     fallback_counter = {}
 
+    # Classes que devem ser classificadas
+    CLASSIFY_CLASSES = ("player", "goalkeeper")
+
     while True:
         ret, frame = cap.read()
         if not ret:
@@ -101,6 +104,12 @@ def process_video(model, classifier, local_video, original_name):
                 labels_file.write(f"{frame_name} {label_str}\n")
                 continue
 
+            # -------------------------
+            # IGNORAR CLASSES NÃO-CLASSIFICÁVEIS
+            # -------------------------
+            if base_label not in CLASSIFY_CLASSES:
+                continue
+
             role = base_label
             team_raw = None
 
@@ -119,7 +128,6 @@ def process_video(model, classifier, local_video, original_name):
                 crop, _ = crop_with_pad(frame, x1, y1, x2, y2, w, h)
 
                 if USE_TEAM_CLASSIFIER:
-                    # YOLO classification batch
                     team_raw = classifier.predict_batch([crop])[0]
                 else:
                     team_raw = None
@@ -156,11 +164,11 @@ def main():
 
     model = load_yolo_model()
 
-    # 🔥 GARANTE DOWNLOAD DO MODELO PYTORCH
+    # 🔥 CARREGAR CLASSIFICADOR YOLO
     classifier = None
     if USE_TEAM_CLASSIFIER:
         load_team_classifier()  # descarrega bestclassifier.pt
-        classifier = TeamClassifier("bestclassifier.pt")  # carrega YOLO classifier
+        classifier = TeamClassifier("bestclassifier.pt")
 
     files_all, files_videos = list_incoming()
     if not files_videos:
@@ -181,9 +189,6 @@ def main():
         start_time = int(data.get("start", 0))
         duration = int(data.get("duration", 0))
 
-        # -------------------------------
-        # CORRECT FINAL VERSION
-        # -------------------------------
         if duration > 0:
             cut_path = cut_video(local_video, start_time, duration)
         else:
@@ -209,18 +214,12 @@ def main():
 
         upload_file(labels_path, f"processed/labels/{os.path.basename(labels_path)}")
 
-        # ---------------------------------------------------------
-        # 1) LINK DO VÍDEO NO BACKBLAZE
-        # ---------------------------------------------------------
         video_url = (
             f"https://f003.backblazeb2.com/file/"
             f"{os.getenv('VIDEOS_BUCKET', 'handball-videos')}/"
             f"{annotated_remote}"
         )
 
-        # ---------------------------------------------------------
-        # 2) CRIAR PÁGINA WORDPRESS AUTOMÁTICA
-        # ---------------------------------------------------------
         wordpress_endpoint = "https://mariocesar.navarro.pt/wp/wp-json/7motion/v1/create-video-page"
 
         payload = {
@@ -233,18 +232,12 @@ def main():
         try:
             resp = requests.post(wordpress_endpoint, json=payload, timeout=20)
             data_wp = resp.json()
-            page_url = data_wp.get("page_url", video_url)  # fallback
+            page_url = data_wp.get("page_url", video_url)
         except Exception:
-            page_url = video_url  # fallback se WP falhar
+            page_url = video_url
 
-        # ---------------------------------------------------------
-        # 3) ENVIAR EMAIL COM LINK WORDPRESS
-        # ---------------------------------------------------------
         send_email(user_email, user_name, page_url)
 
-        # ---------------------------------------------------------
-        # LIMPEZA
-        # ---------------------------------------------------------
         shutil.rmtree("output", ignore_errors=True)
         shutil.rmtree("output_frames", ignore_errors=True)
         shutil.rmtree("output_labels", ignore_errors=True)
