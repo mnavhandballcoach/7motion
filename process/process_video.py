@@ -14,7 +14,7 @@ from ultralytics import YOLO
 from api.b2_client import hard_delete_file
 
 print("\n==============================")
-print("   PROCESS VIDEO PIPELINE v10 + EMA")
+print("   PROCESS VIDEO PIPELINE — versão premium")
 print("==============================\n")
 
 USE_TEAM_CLASSIFIER = True
@@ -189,11 +189,11 @@ def parse_team_classifier_label(label_str):
     return None
 
 # -------------------------------------------------------------
-# Core processing (v10 + image classifier + EMA)
+# Core processing (versão premium)
 # -------------------------------------------------------------
 
 def process_video(model, classifier, local_video, original_name):
-    print(f"🔍 Running YOLO + IMAGE CLASSIFIER + EMA on {local_video}...")
+    print(f"🔍 Running YOLO + IMAGE CLASSIFIER + EMA + CROP + CONF on {local_video}...")
 
     cap = cv2.VideoCapture(local_video)
     fps = cap.get(cv2.CAP_PROP_FPS)
@@ -226,7 +226,8 @@ def process_video(model, classifier, local_video, original_name):
 
     # EMA memory
     team_memory = {}
-    EMA_ALPHA = 0.25
+    last_team = {}
+    EMA_ALPHA = 0.15
 
     while True:
         ret, frame = cap.read()
@@ -270,14 +271,33 @@ def process_video(model, classifier, local_video, original_name):
             if track_id is not None and track_id not in team_memory:
                 team_memory[track_id] = 0.5
 
+            # ------------------------------
+            # Crop aumentado
+            # ------------------------------
+            pad = 35
+            x1p = max(0, x1 - pad)
+            y1p = max(0, y1 - pad)
+            x2p = min(w, x2 + pad)
+            y2p = min(h, y2 + pad)
+
+            crop = frame[y1p:y2p, x1p:x2p]
+
+            # ------------------------------
             # Classificação de imagem
+            # ------------------------------
             if USE_TEAM_CLASSIFIER and classifier is not None:
-                crop = frame[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
                 if crop.size > 0:
                     cls_results = classifier(crop)
+
                     team_idx = int(cls_results[0].probs.top1)
+                    conf = float(cls_results[0].probs.top1conf)
                     raw_label = classifier.names[team_idx]
-                    team_raw = parse_team_classifier_label(raw_label)
+
+                    # Confiança mínima
+                    if conf >= 0.70:
+                        team_raw = parse_team_classifier_label(raw_label)
+                    else:
+                        team_raw = None
 
             # Converter para valor numérico
             if team_raw == "A":
@@ -287,22 +307,35 @@ def process_video(model, classifier, local_video, original_name):
             else:
                 numeric = None
 
+            # ------------------------------
             # Aplicar EMA
+            # ------------------------------
             if track_id is not None:
                 if numeric is not None:
                     team_memory[track_id] = EMA_ALPHA * numeric + (1 - EMA_ALPHA) * team_memory[track_id]
 
-                # Decisão final
-                if team_memory[track_id] > 0.6:
+                # Zona neutra
+                if team_memory[track_id] > 0.65:
                     team = "A"
-                elif team_memory[track_id] < 0.4:
+                elif team_memory[track_id] < 0.35:
                     team = "B"
                 else:
                     team = None
             else:
                 team = team_raw
 
+            # ------------------------------
+            # Fallback inteligente
+            # ------------------------------
+            if track_id is not None:
+                if team is None and track_id in last_team:
+                    team = last_team[track_id]
+                else:
+                    last_team[track_id] = team
+
+            # ------------------------------
             # Combinar YOLO + TeamClassifier
+            # ------------------------------
             if team == "A":
                 final_label = f"{role.capitalize()} Team A"
                 color = COLOR_TEAM_A
@@ -337,7 +370,7 @@ def process_video(model, classifier, local_video, original_name):
 # -------------------------------------------------------------
 
 def main():
-    print(">>> USING process_video v10 + EMA <<<")
+    print(">>> USING process_video — versão premium <<<")
 
     model_path = download_model(MODEL_URL, "best.pt")
     model = YOLO(model_path)
