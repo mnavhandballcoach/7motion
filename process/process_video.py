@@ -2,7 +2,7 @@
 # Toggles
 # ============================
 USE_TEAM_CLASSIFIER = False      # ativa o classificador de equipas
-USE_CLUSTERING = True            # ativa clusterização completa
+USE_CLUSTERING = True            # ativa clusterização por cores (KMeans)
 
 import sys
 import os
@@ -28,12 +28,12 @@ from process.io.ffmpeg import cut_video, convert_video_to_safe_format
 from process.io.emailer import send_email
 
 print("\n==============================")
-print("   PROCESS VIDEO PIPELINE — clusterização + toggles")
+print("   PROCESS VIDEO PIPELINE — clusterização + temporal")
 print("==============================\n")
 
 
 # -----------------------------
-# Clusterização de jogadores
+# Clusterização por cores (KMeans)
 # -----------------------------
 def extract_jersey_feature(crop):
     hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
@@ -41,7 +41,7 @@ def extract_jersey_feature(crop):
     return mean_hsv.astype(np.float32)
 
 
-def cluster_players(features):
+def cluster_players_kmeans(features):
     if len(features) == 0:
         return []
     if len(features) == 1:
@@ -50,9 +50,12 @@ def cluster_players(features):
     X = np.stack(features, axis=0)
     kmeans = KMeans(n_clusters=2, n_init="auto", random_state=42)
     labels = kmeans.fit_predict(X)
-    return labels
+    return labels.tolist()
 
 
+# -----------------------------
+# PROCESS VIDEO
+# -----------------------------
 def process_video(model, classifier, local_video, original_name):
     cap = cv2.VideoCapture(local_video)
     fps = cap.get(cv2.CAP_PROP_FPS)
@@ -86,6 +89,9 @@ def process_video(model, classifier, local_video, original_name):
     team_memory = {}
     last_team = {}
     fallback_counter = {}
+
+    # memória temporal de clusterização por track_id
+    cluster_memory = {}  # track_id -> lista de "A"/"B"
 
     CLASSIFY_CLASSES = ("player", "goalkeeper")
 
@@ -142,7 +148,8 @@ def process_video(model, classifier, local_video, original_name):
                     "track_id": track_id,
                     "x1": x1, "y1": y1, "x2": x2, "y2": y2,
                     "feature": None,
-                    "crop": None
+                    "crop": None,
+                    "team_raw": None
                 })
                 continue
 
@@ -153,21 +160,21 @@ def process_video(model, classifier, local_video, original_name):
                 "track_id": track_id,
                 "x1": x1, "y1": y1, "x2": x2, "y2": y2,
                 "crop": crop,
-                "feature": None
+                "feature": None,
+                "team_raw": None
             })
 
         # -----------------------------
         # 2) CLUSTERIZAÇÃO OU CLASSIFICADOR
         # -----------------------------
         if USE_CLUSTERING:
-            # extrair features
             for p in players:
                 if p["crop"] is None:
                     continue
                 p["feature"] = extract_jersey_feature(p["crop"])
                 features.append(p["feature"])
 
-            cluster_labels = cluster_players(features)
+            cluster_labels = cluster_players_kmeans(features)
 
             idx = 0
             for p in players:
@@ -180,7 +187,6 @@ def process_video(model, classifier, local_video, original_name):
                 p["team_raw"] = "A" if cluster_id == 0 else "B"
 
         else:
-            # usar classificador de equipas
             for p in players:
                 if p["crop"] is None:
                     p["team_raw"] = None
@@ -189,7 +195,21 @@ def process_video(model, classifier, local_video, original_name):
                 p["team_raw"] = pred
 
         # -----------------------------
-        # 3) EMA + FALLBACK
+        # 3) MEMÓRIA TEMPORAL DE CLUSTERIZAÇÃO
+        # -----------------------------
+        for p in players:
+            track_id = p["track_id"]
+            team_raw = p["team_raw"]
+
+            if track_id is not None and team_raw is not None:
+                if track_id not in cluster_memory:
+                    cluster_memory[track_id] = []
+                cluster_memory[track_id].append(team_raw)
+                if len(cluster_memory[track_id]) > 10:
+                    cluster_memory[track_id].pop(0)
+
+        # -----------------------------
+        # 4) EMA + FALLBACK + DECISÃO FINAL
         # -----------------------------
         for p in players:
             role = p["role"]
@@ -197,12 +217,23 @@ def process_video(model, classifier, local_video, original_name):
             x1, y1, x2, y2 = p["x1"], p["y1"], p["x2"], p["y2"]
             team_raw = p["team_raw"]
 
+            # decisão temporal por maioria dos últimos 10 frames
             if track_id is not None:
-                update_ema(team_memory, track_id, team_raw)
+                history = cluster_memory.get(track_id, [])
+                if history:
+                    team_temporal = max(set(history), key=history.count)
+                else:
+                    team_temporal = team_raw
+            else:
+                team_temporal = team_raw
+
+            # EMA + fallback
+            if track_id is not None:
+                update_ema(team_memory, track_id, team_temporal)
                 team = decide_team(team_memory, track_id)
                 team = apply_fallback(track_id, team, last_team, fallback_counter)
             else:
-                team = team_raw
+                team = team_temporal
 
             label_str = draw_entity(frame, role, team, x1, y1, x2, y2)
             labels_file.write(f"{frame_name} {label_str}\n")
@@ -218,7 +249,13 @@ def process_video(model, classifier, local_video, original_name):
     return output_video, frames_dir, labels_path
 
 
+# -----------------------------
+# MAIN
+# -----------------------------
 def main():
+    print("==============================")
+    print("   PROCESS VIDEO PIPELINE — clusterização + temporal")
+    print("==============================\n")
     print(">>> USING process_video — clusterização + toggles <<<")
 
     model = load_yolo_model()
