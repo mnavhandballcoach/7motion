@@ -9,6 +9,7 @@ import cv2
 import shutil
 import json
 import requests
+from collections import Counter  # <-- novo
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -25,8 +26,54 @@ from process.io.ffmpeg import cut_video, convert_video_to_safe_format
 from process.io.emailer import send_email
 
 print("\n==============================")
-print("   PROCESS VIDEO PIPELINE — engine profissional")
+print("   PROCESS VIDEO PIPELINE — engine profissional (AUTO‑MAPPING)")
 print("==============================\n")
+
+
+# -----------------------------
+# AUTO‑MAPPING (equipas reais → A/B)
+# -----------------------------
+AUTO_MAPPING_FRAMES = 200
+team_counts = Counter()
+mapping = None
+
+
+def auto_map_team(team_raw_real, frame_index):
+    """
+    Recebe o nome real da equipa (ex: 'Sporting', 'Porto', 'Benfica', ...)
+    e devolve 'A' ou 'B' depois de aprender as duas equipas dominantes
+    nos primeiros AUTO_MAPPING_FRAMES.
+    """
+    global mapping
+
+    # Antes de termos mapping, contamos frequências
+    if frame_index < AUTO_MAPPING_FRAMES:
+        if team_raw_real is not None:
+            team_counts[team_raw_real] += 1
+        return None
+
+    # No frame limite, definimos automaticamente Team A / Team B
+    if frame_index == AUTO_MAPPING_FRAMES:
+        most_common = team_counts.most_common(2)
+        if len(most_common) < 2:
+            print("⚠️ Não foi possível identificar duas equipas distintas.")
+            return None
+
+        teamA_real = most_common[0][0]
+        teamB_real = most_common[1][0]
+
+        mapping = {
+            teamA_real: "A",
+            teamB_real: "B",
+        }
+
+        print(f"🔧 AUTO‑MAPPING definido: {teamA_real} → A, {teamB_real} → B")
+
+    # Depois disso, usamos o mapping
+    if mapping is not None and team_raw_real is not None:
+        return mapping.get(team_raw_real, None)
+
+    return None
 
 
 def process_video(model, classifier, local_video, original_name):
@@ -100,20 +147,25 @@ def process_video(model, classifier, local_video, original_name):
                 continue
 
             role = base_label
-            team_raw = None
+            team_raw_real = None  # nome real da equipa (Sporting, Porto, etc.)
+            team_raw = None       # 'A' / 'B' depois de auto‑mapping
 
             if track_id is not None:
                 init_track_memory(team_memory, fallback_counter, last_team, track_id)
 
             if is_box_too_small(w_box, h_box):
-                team_raw = None
+                team_raw_real = None
             else:
                 crop, _ = crop_with_pad(frame, x1, y1, x2, y2, w, h)
 
                 if USE_TEAM_CLASSIFIER and classifier is not None:
-                    team_raw = classifier.predict_batch([crop])[0]
+                    # TeamClassifier agora devolve o nome real da equipa
+                    team_raw_real = classifier.predict_batch([crop])[0]
                 else:
-                    team_raw = None
+                    team_raw_real = None
+
+            # AUTO‑MAPPING: transformar equipa real → 'A' / 'B'
+            team_raw = auto_map_team(team_raw_real, frame_index)
 
             if track_id is not None:
                 update_ema(team_memory, track_id, team_raw)
@@ -137,7 +189,7 @@ def process_video(model, classifier, local_video, original_name):
 
 
 def main():
-    print(">>> USING process_video — engine profissional <<<")
+    print(">>> USING process_video — engine profissional (AUTO‑MAPPING) <<<")
 
     model = load_yolo_model()
 
