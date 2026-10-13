@@ -2,7 +2,6 @@ import os
 import cv2
 import json
 import time
-import math
 import boto3
 import smtplib
 import traceback
@@ -141,15 +140,12 @@ def process_video(video_key, user_email):
             break
 
         frame_index += 1
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
         # ============================
         # 1. Detecção + tracking
         # ============================
 
-        detections = []  # aqui entra o output do teu detector (YOLO, etc.)
-        # detections: lista de dicts com keys: x1, y1, x2, y2, cls, score
-
+        detections = []  # substitui pelo output do teu YOLO
         tracks = update_tracks(tracker, detections)
 
         frame_players = []
@@ -174,7 +170,7 @@ def process_video(video_key, user_email):
             }
 
             # ============================
-            # 2. Calibração inicial (primeiros N_CALIB_FRAMES)
+            # 2. Calibração inicial
             # ============================
 
             if frame_index <= N_CALIB_FRAMES:
@@ -186,7 +182,7 @@ def process_video(video_key, user_email):
                 continue
 
             # ============================
-            # 3. Clustering inicial (no frame N_CALIB_FRAMES + 1)
+            # 3. Clustering inicial
             # ============================
 
             if frame_index == N_CALIB_FRAMES + 1 and centroids is None:
@@ -197,7 +193,7 @@ def process_video(video_key, user_email):
                 log(f"Team clusters: A={team_A}, B={team_B}")
 
             # ============================
-            # 4. Atribuição de equipa por embedding
+            # 4. Atribuição de equipa
             # ============================
 
             jersey = crop_jersey_only(crop)
@@ -206,7 +202,6 @@ def process_video(video_key, user_email):
             cluster_id = assign_cluster(emb, centroids)
             team_raw = assign_team(cluster_id, team_A, team_B)
 
-            # Fallback HSV quando embedding está instável
             if team_raw is None:
                 hsv = hsv_feature(jersey)
                 cluster_id = assign_cluster(hsv, centroids)
@@ -215,15 +210,14 @@ def process_video(video_key, user_email):
             player_info["team_raw"] = team_raw
 
             # ============================
-            # 5. EMA + votação por track_id
+            # 5. EMA + votação
             # ============================
 
             if track_id not in team_memory:
                 team_memory[track_id] = None
                 track_votes[track_id] = []
 
-            team_temporal = team_raw
-            update_ema(team_memory, track_id, team_temporal, decay=EMA_DECAY)
+            update_ema(team_memory, track_id, team_raw, decay=EMA_DECAY)
 
             if team_memory[track_id] is not None:
                 track_votes[track_id].append(team_memory[track_id])
