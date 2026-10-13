@@ -1,8 +1,11 @@
 # ============================
 # Toggles
 # ============================
-USE_TEAM_CLASSIFIER = False      # ativa o classificador de equipas
-USE_CLUSTERING = True            # ativa clusterização por cores (KMeans)
+USE_TEAM_CLASSIFIER = True       # usa o teu classificador de equipas
+USE_CLUSTERING = True            # usa clustering por cores
+N_CALIB_FRAMES = 200             # nº de frames para calibração inicial
+JERSEY_TOP = 0.2                 # percentagem topo do tronco
+JERSEY_BOTTOM = 0.6              # percentagem fundo do tronco
 
 import sys
 import os
@@ -22,35 +25,82 @@ from process.core.classifier import TeamClassifier
 from process.core.ema import init_track_memory, update_ema, decide_team
 from process.core.fallback import apply_fallback
 from process.core.drawer import draw_entity
+from process.core.utils import is_player_class
 
 from process.io.storage import list_incoming, download_video_and_json, upload_file, delete_incoming
 from process.io.ffmpeg import cut_video, convert_video_to_safe_format
 from process.io.emailer import send_email
 
 print("\n==============================")
-print("   PROCESS VIDEO PIPELINE — clusterização + temporal")
+print("   PROCESS VIDEO PIPELINE — calibração + clustering + tracking")
 print("==============================\n")
 
 
 # -----------------------------
-# Clusterização por cores (KMeans)
+# 1) Recorte da camisola
 # -----------------------------
-def extract_jersey_feature(crop):
+def crop_jersey(crop):
+    h, w, _ = crop.shape
+    y1 = int(h * JERSEY_TOP)
+    y2 = int(h * JERSEY_BOTTOM)
+    return crop[y1:y2, :]
+
+
+# -----------------------------
+# 2) Histograma HSV (Hue + Saturation)
+# -----------------------------
+def extract_hsv_histogram(crop, bins_h=16, bins_s=8):
     hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-    mean_hsv = hsv.reshape(-1, 3).mean(axis=0)
-    return mean_hsv.astype(np.float32)
+    h, s, v = cv2.split(hsv)
+
+    hist_h = cv2.calcHist([h], [0], None, [bins_h], [0, 180])
+    hist_s = cv2.calcHist([s], [0], None, [bins_s], [0, 256])
+
+    hist_h = cv2.normalize(hist_h, hist_h).flatten()
+    hist_s = cv2.normalize(hist_s, hist_s).flatten()
+
+    feature = np.concatenate([hist_h, hist_s]).astype(np.float32)
+    return feature
 
 
-def cluster_players_kmeans(features):
-    if len(features) == 0:
-        return []
-    if len(features) == 1:
-        return [0]
+# -----------------------------
+# 3) Clustering k=4 na calibração
+# -----------------------------
+def cluster_calibration(features, n_clusters=4):
+    if len(features) < n_clusters:
+        return None, None
 
     X = np.stack(features, axis=0)
-    kmeans = KMeans(n_clusters=2, n_init="auto", random_state=42)
+    kmeans = KMeans(n_clusters=n_clusters, n_init="auto", random_state=42)
     labels = kmeans.fit_predict(X)
-    return labels.tolist()
+    centers = kmeans.cluster_centers_
+
+    return labels, centers
+
+
+def assign_cluster(feature, centers):
+    dists = np.linalg.norm(centers - feature, axis=1)
+    return int(np.argmin(dists))
+
+
+# -----------------------------
+# 4) Definir quais clusters são equipas A/B
+# -----------------------------
+def identify_team_clusters(features, labels):
+    # conta elementos por cluster
+    counts = {}
+    for lab in labels:
+        counts[lab] = counts.get(lab, 0) + 1
+
+    # ordena clusters por tamanho (desc)
+    sorted_clusters = sorted(counts.items(), key=lambda x: x[1], reverse=True)
+    if len(sorted_clusters) < 2:
+        return None, None
+
+    team_cluster_A = sorted_clusters[0][0]
+    team_cluster_B = sorted_clusters[1][0]
+
+    return team_cluster_A, team_cluster_B
 
 
 # -----------------------------
@@ -90,10 +140,12 @@ def process_video(model, classifier, local_video, original_name):
     last_team = {}
     fallback_counter = {}
 
-    # memória temporal de clusterização por track_id
-    cluster_memory = {}  # track_id -> lista de "A"/"B"
-
-    CLASSIFY_CLASSES = ("player", "goalkeeper")
+    # memória temporal por track_id
+    track_votes = {}       # track_id -> lista de "A"/"B"
+    cluster_centers = None
+    team_cluster_A = None
+    team_cluster_B = None
+    calib_features = []
 
     while True:
         ret, frame = cap.read()
@@ -107,7 +159,6 @@ def process_video(model, classifier, local_video, original_name):
         frame_path = os.path.join(frames_dir, frame_name)
 
         players = []
-        features = []
 
         # -----------------------------
         # 1) DETEÇÃO
@@ -134,7 +185,7 @@ def process_video(model, classifier, local_video, original_name):
                 labels_file.write(f"{frame_name} {label_str}\n")
                 continue
 
-            if base_label not in CLASSIFY_CLASSES:
+            if not is_player_class(base_label):
                 continue
 
             role = base_label
@@ -147,69 +198,95 @@ def process_video(model, classifier, local_video, original_name):
                     "role": role,
                     "track_id": track_id,
                     "x1": x1, "y1": y1, "x2": x2, "y2": y2,
-                    "feature": None,
                     "crop": None,
+                    "jersey_crop": None,
+                    "feature": None,
                     "team_raw": None
                 })
                 continue
 
             crop, _ = crop_with_pad(frame, x1, y1, x2, y2, w, h)
+            jersey = crop_jersey(crop)
 
             players.append({
                 "role": role,
                 "track_id": track_id,
                 "x1": x1, "y1": y1, "x2": x2, "y2": y2,
                 "crop": crop,
+                "jersey_crop": jersey,
                 "feature": None,
                 "team_raw": None
             })
 
         # -----------------------------
-        # 2) CLUSTERIZAÇÃO OU CLASSIFICADOR
+        # 2) CALIBRAÇÃO INICIAL (primeiros N_CALIB_FRAMES)
         # -----------------------------
-        if USE_CLUSTERING:
+        if frame_index < N_CALIB_FRAMES and USE_CLUSTERING:
             for p in players:
-                if p["crop"] is None:
+                if p["jersey_crop"] is None:
                     continue
-                p["feature"] = extract_jersey_feature(p["crop"])
-                features.append(p["feature"])
+                feat = extract_hsv_histogram(p["jersey_crop"])
+                calib_features.append(feat)
 
-            cluster_labels = cluster_players_kmeans(features)
-
-            idx = 0
-            for p in players:
-                if p["feature"] is None:
-                    p["team_raw"] = None
-                    continue
-
-                cluster_id = cluster_labels[idx]
-                idx += 1
-                p["team_raw"] = "A" if cluster_id == 0 else "B"
-
-        else:
-            for p in players:
-                if p["crop"] is None:
-                    p["team_raw"] = None
-                    continue
-                pred = classifier.predict(p["crop"])
-                p["team_raw"] = pred
+            if frame_index == N_CALIB_FRAMES - 1 and len(calib_features) >= 8:
+                labels, centers = cluster_calibration(calib_features, n_clusters=4)
+                if centers is not None:
+                    cluster_centers = centers
+                    team_cluster_A, team_cluster_B = identify_team_clusters(calib_features, labels)
+                    print("Calibração concluída:")
+                    print("  team_cluster_A:", team_cluster_A)
+                    print("  team_cluster_B:", team_cluster_B)
 
         # -----------------------------
-        # 3) MEMÓRIA TEMPORAL DE CLUSTERIZAÇÃO
+        # 3) ATRIBUIÇÃO DE EQUIPA (após calibração)
         # -----------------------------
         for p in players:
             track_id = p["track_id"]
-            team_raw = p["team_raw"]
+            jersey = p["jersey_crop"]
 
+            if jersey is None:
+                p["team_raw"] = None
+                continue
+
+            # feature para clustering
+            feat = extract_hsv_histogram(jersey)
+            p["feature"] = feat
+
+            team_kmeans = None
+            if USE_CLUSTERING and cluster_centers is not None and team_cluster_A is not None and team_cluster_B is not None:
+                cluster_id = assign_cluster(feat, cluster_centers)
+                if cluster_id == team_cluster_A:
+                    team_kmeans = "A"
+                elif cluster_id == team_cluster_B:
+                    team_kmeans = "B"
+                else:
+                    team_kmeans = None
+
+            team_cls = None
+            conf_cls = 0.0
+            if USE_TEAM_CLASSIFIER and p["crop"] is not None:
+                team_cls, conf_cls = classifier.predict_with_confidence(p["crop"])
+
+            # fusão simples: se classificador confiante, usa; senão KMeans
+            if team_cls is not None and conf_cls >= 0.7:
+                team_raw = team_cls
+            elif team_kmeans is not None:
+                team_raw = team_kmeans
+            else:
+                team_raw = team_cls if team_cls is not None else None
+
+            p["team_raw"] = team_raw
+
+            # votos por track_id
             if track_id is not None and team_raw is not None:
-                if track_id not in cluster_memory:
-                    cluster_memory[track_id] = []
-                cluster_memory[track_id].append(team_raw)
-                if len(cluster_memory[track_id]) > 10:
-                    cluster_memory[track_id].pop(0)
+                if track_id not in track_votes:
+                    track_votes[track_id] = []
+                track_votes[track_id].append(team_raw)
+                if len(track_votes[track_id]) > 50:
+                    track_votes[track_id].pop(0)
 
         # -----------------------------
-        # 4) EMA + FALLBACK + DECISÃO FINAL
+        # 4) EMA + FALLBACK + MODA POR TRACK_ID
         # -----------------------------
         for p in players:
             role = p["role"]
@@ -217,9 +294,9 @@ def process_video(model, classifier, local_video, original_name):
             x1, y1, x2, y2 = p["x1"], p["y1"], p["x2"], p["y2"]
             team_raw = p["team_raw"]
 
-            # decisão temporal por maioria dos últimos 10 frames
+            # moda por track_id
             if track_id is not None:
-                history = cluster_memory.get(track_id, [])
+                history = track_votes.get(track_id, [])
                 if history:
                     team_temporal = max(set(history), key=history.count)
                 else:
@@ -227,7 +304,6 @@ def process_video(model, classifier, local_video, original_name):
             else:
                 team_temporal = team_raw
 
-            # EMA + fallback
             if track_id is not None:
                 update_ema(team_memory, track_id, team_temporal)
                 team = decide_team(team_memory, track_id)
@@ -254,9 +330,8 @@ def process_video(model, classifier, local_video, original_name):
 # -----------------------------
 def main():
     print("==============================")
-    print("   PROCESS VIDEO PIPELINE — clusterização + temporal")
+    print("   PROCESS VIDEO PIPELINE — calibração + clustering + tracking")
     print("==============================\n")
-    print(">>> USING process_video — clusterização + toggles <<<")
 
     model = load_yolo_model()
 
