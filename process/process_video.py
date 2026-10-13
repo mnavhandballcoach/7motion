@@ -148,7 +148,7 @@ def process_video(model, classifier, local_video, original_name):
                 p["team_raw"] = None
                 continue
 
-            team_raw = classifier.predict(crop)
+            team_raw = classifier.predict(crop)  # "Team A" ou "Team B"
             team_raw = "A" if "A" in team_raw else "B"
 
             p["team_raw"] = team_raw
