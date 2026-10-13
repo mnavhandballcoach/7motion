@@ -1,7 +1,8 @@
 # ============================
-# Team Classifier Toggle
+# Toggles
 # ============================
-USE_TEAM_CLASSIFIER = True  # ativa o classificador
+USE_TEAM_CLASSIFIER = False      # ativa o classificador de equipas
+USE_CLUSTERING = True            # ativa clusterização completa
 
 import sys
 import os
@@ -9,7 +10,8 @@ import cv2
 import shutil
 import json
 import requests
-from collections import Counter  # <-- novo
+import numpy as np
+from sklearn.cluster import KMeans
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -26,54 +28,29 @@ from process.io.ffmpeg import cut_video, convert_video_to_safe_format
 from process.io.emailer import send_email
 
 print("\n==============================")
-print("   PROCESS VIDEO PIPELINE — engine profissional (AUTO‑MAPPING)")
+print("   PROCESS VIDEO PIPELINE — clusterização + toggles")
 print("==============================\n")
 
 
 # -----------------------------
-# AUTO‑MAPPING (equipas reais → A/B)
+# Clusterização de jogadores
 # -----------------------------
-AUTO_MAPPING_FRAMES = 200
-team_counts = Counter()
-mapping = None
+def extract_jersey_feature(crop):
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    mean_hsv = hsv.reshape(-1, 3).mean(axis=0)
+    return mean_hsv.astype(np.float32)
 
 
-def auto_map_team(team_raw_real, frame_index):
-    """
-    Recebe o nome real da equipa (ex: 'Sporting', 'Porto', 'Benfica', ...)
-    e devolve 'A' ou 'B' depois de aprender as duas equipas dominantes
-    nos primeiros AUTO_MAPPING_FRAMES.
-    """
-    global mapping
+def cluster_players(features):
+    if len(features) == 0:
+        return []
+    if len(features) == 1:
+        return [0]
 
-    # Antes de termos mapping, contamos frequências
-    if frame_index < AUTO_MAPPING_FRAMES:
-        if team_raw_real is not None:
-            team_counts[team_raw_real] += 1
-        return None
-
-    # No frame limite, definimos automaticamente Team A / Team B
-    if frame_index == AUTO_MAPPING_FRAMES:
-        most_common = team_counts.most_common(2)
-        if len(most_common) < 2:
-            print("⚠️ Não foi possível identificar duas equipas distintas.")
-            return None
-
-        teamA_real = most_common[0][0]
-        teamB_real = most_common[1][0]
-
-        mapping = {
-            teamA_real: "A",
-            teamB_real: "B",
-        }
-
-        print(f"🔧 AUTO‑MAPPING definido: {teamA_real} → A, {teamB_real} → B")
-
-    # Depois disso, usamos o mapping
-    if mapping is not None and team_raw_real is not None:
-        return mapping.get(team_raw_real, None)
-
-    return None
+    X = np.stack(features, axis=0)
+    kmeans = KMeans(n_clusters=2, n_init="auto", random_state=42)
+    labels = kmeans.fit_predict(X)
+    return labels
 
 
 def process_video(model, classifier, local_video, original_name):
@@ -123,6 +100,12 @@ def process_video(model, classifier, local_video, original_name):
         frame_name = f"frame_{frame_index:05d}.jpg"
         frame_path = os.path.join(frames_dir, frame_name)
 
+        players = []
+        features = []
+
+        # -----------------------------
+        # 1) DETEÇÃO
+        # -----------------------------
         for box in detections:
             cls = int(box.cls[0])
             base_label = model.names[cls].lower()
@@ -133,11 +116,13 @@ def process_video(model, classifier, local_video, original_name):
 
             track_id = int(box.id[0]) if box.id is not None else None
 
+            # árbitro
             if base_label == "referee":
                 label_str = draw_entity(frame, "referee", None, x1, y1, x2, y2)
                 labels_file.write(f"{frame_name} {label_str}\n")
                 continue
 
+            # bola
             if base_label == "ball":
                 label_str = draw_entity(frame, "ball", None, x1, y1, x2, y2)
                 labels_file.write(f"{frame_name} {label_str}\n")
@@ -147,25 +132,70 @@ def process_video(model, classifier, local_video, original_name):
                 continue
 
             role = base_label
-            team_raw_real = None  # nome real da equipa (Sporting, Porto, etc.)
-            team_raw = None       # 'A' / 'B' depois de auto‑mapping
 
             if track_id is not None:
                 init_track_memory(team_memory, fallback_counter, last_team, track_id)
 
             if is_box_too_small(w_box, h_box):
-                team_raw_real = None
-            else:
-                crop, _ = crop_with_pad(frame, x1, y1, x2, y2, w, h)
+                players.append({
+                    "role": role,
+                    "track_id": track_id,
+                    "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+                    "feature": None,
+                    "crop": None
+                })
+                continue
 
-                if USE_TEAM_CLASSIFIER and classifier is not None:
-                    # TeamClassifier agora devolve o nome real da equipa
-                    team_raw_real = classifier.predict_batch([crop])[0]
-                else:
-                    team_raw_real = None
+            crop, _ = crop_with_pad(frame, x1, y1, x2, y2, w, h)
 
-            # AUTO‑MAPPING: transformar equipa real → 'A' / 'B'
-            team_raw = auto_map_team(team_raw_real, frame_index)
+            players.append({
+                "role": role,
+                "track_id": track_id,
+                "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+                "crop": crop,
+                "feature": None
+            })
+
+        # -----------------------------
+        # 2) CLUSTERIZAÇÃO OU CLASSIFICADOR
+        # -----------------------------
+        if USE_CLUSTERING:
+            # extrair features
+            for p in players:
+                if p["crop"] is None:
+                    continue
+                p["feature"] = extract_jersey_feature(p["crop"])
+                features.append(p["feature"])
+
+            cluster_labels = cluster_players(features)
+
+            idx = 0
+            for p in players:
+                if p["feature"] is None:
+                    p["team_raw"] = None
+                    continue
+
+                cluster_id = cluster_labels[idx]
+                idx += 1
+                p["team_raw"] = "A" if cluster_id == 0 else "B"
+
+        else:
+            # usar classificador de equipas
+            for p in players:
+                if p["crop"] is None:
+                    p["team_raw"] = None
+                    continue
+                pred = classifier.predict(p["crop"])
+                p["team_raw"] = pred
+
+        # -----------------------------
+        # 3) EMA + FALLBACK
+        # -----------------------------
+        for p in players:
+            role = p["role"]
+            track_id = p["track_id"]
+            x1, y1, x2, y2 = p["x1"], p["y1"], p["x2"], p["y2"]
+            team_raw = p["team_raw"]
 
             if track_id is not None:
                 update_ema(team_memory, track_id, team_raw)
@@ -189,7 +219,7 @@ def process_video(model, classifier, local_video, original_name):
 
 
 def main():
-    print(">>> USING process_video — engine profissional (AUTO‑MAPPING) <<<")
+    print(">>> USING process_video — clusterização + toggles <<<")
 
     model = load_yolo_model()
 
