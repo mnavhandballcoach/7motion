@@ -1,9 +1,8 @@
 # ============================
 # Toggles
 # ============================
-USE_TEAM_CLASSIFIER = True
-USE_CLUSTERING = False
-N_CALIB_FRAMES = 0
+USE_CLUSTERING = True
+N_CALIB_FRAMES = 200  # nº de frames para calibrar equipas
 JERSEY_TOP = 0.2
 JERSEY_BOTTOM = 0.6
 
@@ -20,25 +19,35 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from process.core.models import load_yolo_model
 from process.core.cropper import crop_with_pad, is_box_too_small
-from process.core.team_classifier.pytorch_team_classifier import TeamClassifier
 from process.core.ema import init_track_memory, update_ema, decide_team
 from process.core.fallback import apply_fallback
 from process.core.drawer import draw_entity
 from process.core.utils import is_player_class
+
+# === CLUSTERING UNIVERSAL ===
+from process.core.clustering import (
+    crop_jersey_only,
+    extract_embedding,
+    run_initial_clustering,
+    identify_team_clusters,
+    decide_team_A_B,
+    assign_cluster,
+    assign_team
+)
 
 from process.io.storage import list_incoming, download_video_and_json, upload_file, delete_incoming
 from process.io.ffmpeg import cut_video, convert_video_to_safe_format
 from process.io.emailer import send_email
 
 print("\n==============================")
-print("   PROCESS VIDEO PIPELINE — versão PyTorch")
+print("   PROCESS VIDEO PIPELINE — clustering universal")
 print("==============================\n")
 
 
 # -----------------------------
-# PROCESS VIDEO (versão limpa)
+# PROCESS VIDEO
 # -----------------------------
-def process_video(model, classifier, local_video, original_name):
+def process_video(model, classifier_unused, local_video, original_name):
     cap = cv2.VideoCapture(local_video)
     fps = cap.get(cv2.CAP_PROP_FPS)
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -68,6 +77,14 @@ def process_video(model, classifier, local_video, original_name):
 
     frame_index = 0
 
+    # === CLUSTERING STATE ===
+    embeddings = []
+    bboxes = []
+    centroids = None
+    team_A = None
+    team_B = None
+
+    # === TRACKING STATE ===
     team_memory = {}
     last_team = {}
     fallback_counter = {}
@@ -138,7 +155,7 @@ def process_video(model, classifier, local_video, original_name):
             })
 
         # -----------------------------
-        # 2) CLASSIFICAÇÃO PyTorch
+        # 2) CLUSTERING UNIVERSAL
         # -----------------------------
         for p in players:
             crop = p["crop"]
@@ -148,11 +165,34 @@ def process_video(model, classifier, local_video, original_name):
                 p["team_raw"] = None
                 continue
 
-            team_raw = classifier.predict(crop)  # "Team A" ou "Team B"
-            team_raw = "A" if "A" in team_raw else "B"
+            # === CALIBRAÇÃO INICIAL ===
+            if frame_index < N_CALIB_FRAMES:
+                jersey = crop_jersey_only(crop)
+                emb = extract_embedding(jersey)
+                embeddings.append(emb)
+                bboxes.append((p["x1"], p["y1"], p["x2"], p["y2"]))
+                p["team_raw"] = None
+                continue
+
+            # === CORRER CLUSTERING NO FRAME EXACTO ===
+            if frame_index == N_CALIB_FRAMES:
+                centroids, labels = run_initial_clustering(embeddings)
+                team_clusters = identify_team_clusters(labels)
+                team_A, team_B = decide_team_A_B(team_clusters, bboxes, labels)
+
+                print("=== CLUSTERING CALIBRADO ===")
+                print("Team A cluster:", team_A)
+                print("Team B cluster:", team_B)
+
+            # === ATRIBUIÇÃO POR CENTRÓIDE ===
+            jersey = crop_jersey_only(crop)
+            emb = extract_embedding(jersey)
+            cluster_id = assign_cluster(emb, centroids)
+            team_raw = assign_team(cluster_id, team_A, team_B)
 
             p["team_raw"] = team_raw
 
+            # === TRACK VOTES ===
             if track_id is not None:
                 if track_id not in track_votes:
                     track_votes[track_id] = []
@@ -161,7 +201,7 @@ def process_video(model, classifier, local_video, original_name):
                     track_votes[track_id].pop(0)
 
         # -----------------------------
-        # 3) EMA + FALLBACK + MODA POR TRACK_ID
+        # 3) EMA + FALLBACK + TRACKING
         # -----------------------------
         for p in players:
             role = p["role"]
@@ -204,16 +244,11 @@ def process_video(model, classifier, local_video, original_name):
 # -----------------------------
 def main():
     print("==============================")
-    print("   PROCESS VIDEO PIPELINE — versão PyTorch")
+    print("   PROCESS VIDEO PIPELINE — clustering universal")
     print("==============================\n")
 
     model = load_yolo_model()
-
-    classifier = None
-    if USE_TEAM_CLASSIFIER:
-        from process.core.models import load_team_classifier
-        model_path = load_team_classifier()   # descarrega bestclassifier.pt
-        classifier = TeamClassifier(model_path)
+    classifier = None  # clustering substitui classificador
 
     files_all, files_videos = list_incoming()
     if not files_videos:
