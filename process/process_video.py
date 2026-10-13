@@ -2,10 +2,10 @@
 # Toggles
 # ============================
 USE_TEAM_CLASSIFIER = True       # usa o teu classificador de equipas
-USE_CLUSTERING = True            # usa clustering por cores
-N_CALIB_FRAMES = 200             # nº de frames para calibração inicial
-JERSEY_TOP = 0.2                 # percentagem topo do tronco
-JERSEY_BOTTOM = 0.6              # percentagem fundo do tronco
+USE_CLUSTERING = False           # desativado: pipeline limpo
+N_CALIB_FRAMES = 0               # desativado
+JERSEY_TOP = 0.2
+JERSEY_BOTTOM = 0.6
 
 import sys
 import os
@@ -14,7 +14,6 @@ import shutil
 import json
 import requests
 import numpy as np
-from sklearn.cluster import KMeans
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -32,79 +31,12 @@ from process.io.ffmpeg import cut_video, convert_video_to_safe_format
 from process.io.emailer import send_email
 
 print("\n==============================")
-print("   PROCESS VIDEO PIPELINE — calibração + clustering + tracking")
+print("   PROCESS VIDEO PIPELINE — versão limpa e estável")
 print("==============================\n")
 
 
 # -----------------------------
-# 1) Recorte da camisola
-# -----------------------------
-def crop_jersey(crop):
-    h, w, _ = crop.shape
-    y1 = int(h * JERSEY_TOP)
-    y2 = int(h * JERSEY_BOTTOM)
-    return crop[y1:y2, :]
-
-
-# -----------------------------
-# 2) Histograma HSV (Hue + Saturation)
-# -----------------------------
-def extract_hsv_histogram(crop, bins_h=16, bins_s=8):
-    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-    h, s, v = cv2.split(hsv)
-
-    hist_h = cv2.calcHist([h], [0], None, [bins_h], [0, 180])
-    hist_s = cv2.calcHist([s], [0], None, [bins_s], [0, 256])
-
-    hist_h = cv2.normalize(hist_h, hist_h).flatten()
-    hist_s = cv2.normalize(hist_s, hist_s).flatten()
-
-    feature = np.concatenate([hist_h, hist_s]).astype(np.float32)
-    return feature
-
-
-# -----------------------------
-# 3) Clustering k=4 na calibração
-# -----------------------------
-def cluster_calibration(features, n_clusters=4):
-    if len(features) < n_clusters:
-        return None, None
-
-    X = np.stack(features, axis=0)
-    kmeans = KMeans(n_clusters=n_clusters, n_init="auto", random_state=42)
-    labels = kmeans.fit_predict(X)
-    centers = kmeans.cluster_centers_
-
-    return labels, centers
-
-
-def assign_cluster(feature, centers):
-    dists = np.linalg.norm(centers - feature, axis=1)
-    return int(np.argmin(dists))
-
-
-# -----------------------------
-# 4) Definir quais clusters são equipas A/B
-# -----------------------------
-def identify_team_clusters(features, labels):
-    # conta elementos por cluster
-    counts = {}
-    for lab in labels:
-        counts[lab] = counts.get(lab, 0) + 1
-
-    # ordena clusters por tamanho (desc)
-    sorted_clusters = sorted(counts.items(), key=lambda x: x[1], reverse=True)
-    if len(sorted_clusters) < 2:
-        return None, None
-
-    team_cluster_A = sorted_clusters[0][0]
-    team_cluster_B = sorted_clusters[1][0]
-
-    return team_cluster_A, team_cluster_B
-
-
-# -----------------------------
-# PROCESS VIDEO
+# PROCESS VIDEO (versão limpa)
 # -----------------------------
 def process_video(model, classifier, local_video, original_name):
     cap = cv2.VideoCapture(local_video)
@@ -136,16 +68,11 @@ def process_video(model, classifier, local_video, original_name):
 
     frame_index = 0
 
+    # memória temporal
     team_memory = {}
     last_team = {}
     fallback_counter = {}
-
-    # memória temporal por track_id
-    track_votes = {}       # track_id -> lista de "A"/"B"
-    cluster_centers = None
-    team_cluster_A = None
-    team_cluster_B = None
-    calib_features = []
+    track_votes = {}  # track_id -> lista de "A"/"B"
 
     while True:
         ret, frame = cap.read()
@@ -199,81 +126,41 @@ def process_video(model, classifier, local_video, original_name):
                     "track_id": track_id,
                     "x1": x1, "y1": y1, "x2": x2, "y2": y2,
                     "crop": None,
-                    "jersey_crop": None,
-                    "feature": None,
                     "team_raw": None
                 })
                 continue
 
             crop, _ = crop_with_pad(frame, x1, y1, x2, y2, w, h)
-            jersey = crop_jersey(crop)
 
             players.append({
                 "role": role,
                 "track_id": track_id,
                 "x1": x1, "y1": y1, "x2": x2, "y2": y2,
                 "crop": crop,
-                "jersey_crop": jersey,
-                "feature": None,
                 "team_raw": None
             })
 
         # -----------------------------
-        # 2) CALIBRAÇÃO INICIAL (primeiros N_CALIB_FRAMES)
-        # -----------------------------
-        if frame_index < N_CALIB_FRAMES and USE_CLUSTERING:
-            for p in players:
-                if p["jersey_crop"] is None:
-                    continue
-                feat = extract_hsv_histogram(p["jersey_crop"])
-                calib_features.append(feat)
-
-            if frame_index == N_CALIB_FRAMES - 1 and len(calib_features) >= 8:
-                labels, centers = cluster_calibration(calib_features, n_clusters=4)
-                if centers is not None:
-                    cluster_centers = centers
-                    team_cluster_A, team_cluster_B = identify_team_clusters(calib_features, labels)
-                    print("Calibração concluída:")
-                    print("  team_cluster_A:", team_cluster_A)
-                    print("  team_cluster_B:", team_cluster_B)
-
-        # -----------------------------
-        # 3) ATRIBUIÇÃO DE EQUIPA (após calibração)
+        # 2) CLASSIFICAÇÃO LIMPA
         # -----------------------------
         for p in players:
+            crop = p["crop"]
             track_id = p["track_id"]
-            jersey = p["jersey_crop"]
 
-            if jersey is None:
+            if crop is None:
                 p["team_raw"] = None
                 continue
 
-            # feature para clustering
-            feat = extract_hsv_histogram(jersey)
-            p["feature"] = feat
+            # classificador principal
+            team_cls, conf_cls = classifier.predict_with_confidence(crop)
 
-            team_kmeans = None
-            if USE_CLUSTERING and cluster_centers is not None and team_cluster_A is not None and team_cluster_B is not None:
-                cluster_id = assign_cluster(feat, cluster_centers)
-                if cluster_id == team_cluster_A:
-                    team_kmeans = "A"
-                elif cluster_id == team_cluster_B:
-                    team_kmeans = "B"
-                else:
-                    team_kmeans = None
-
-            team_cls = None
-            conf_cls = 0.0
-            if USE_TEAM_CLASSIFIER and p["crop"] is not None:
-                team_cls, conf_cls = classifier.predict_with_confidence(p["crop"])
-
-            # fusão simples: se classificador confiante, usa; senão KMeans
             if team_cls is not None and conf_cls >= 0.7:
                 team_raw = team_cls
-            elif team_kmeans is not None:
-                team_raw = team_kmeans
             else:
-                team_raw = team_cls if team_cls is not None else None
+                # fallback simples baseado em Hue médio
+                hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+                mean_hsv = hsv.reshape(-1, 3).mean(axis=0)
+                team_raw = "A" if mean_hsv[0] < 90 else "B"
 
             p["team_raw"] = team_raw
 
@@ -286,7 +173,7 @@ def process_video(model, classifier, local_video, original_name):
                     track_votes[track_id].pop(0)
 
         # -----------------------------
-        # 4) EMA + FALLBACK + MODA POR TRACK_ID
+        # 3) EMA + FALLBACK + MODA POR TRACK_ID
         # -----------------------------
         for p in players:
             role = p["role"]
@@ -330,7 +217,7 @@ def process_video(model, classifier, local_video, original_name):
 # -----------------------------
 def main():
     print("==============================")
-    print("   PROCESS VIDEO PIPELINE — calibração + clustering + tracking")
+    print("   PROCESS VIDEO PIPELINE — versão limpa e estável")
     print("==============================\n")
 
     model = load_yolo_model()
