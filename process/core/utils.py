@@ -9,6 +9,13 @@ def parse_team_classifier_label(label_str):
         return "B"
     return None
 
+def is_player_class(label: str) -> bool:
+    """
+    Retorna True se o label for 'player' ou 'goalkeeper'.
+    """
+    return label in ("player", "goalkeeper")
+
+
 def laplacian_variance(image):
     if image is None or image.size == 0:
         return 0.0
