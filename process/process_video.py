@@ -1,9 +1,9 @@
 # ============================
 # Toggles
 # ============================
-USE_TEAM_CLASSIFIER = True       # usa o teu classificador de equipas
-USE_CLUSTERING = False           # desativado: pipeline limpo
-N_CALIB_FRAMES = 0               # desativado
+USE_TEAM_CLASSIFIER = True
+USE_CLUSTERING = False
+N_CALIB_FRAMES = 0
 JERSEY_TOP = 0.2
 JERSEY_BOTTOM = 0.6
 
@@ -18,9 +18,9 @@ import numpy as np
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from process.core.models import load_yolo_model, load_team_classifier
+from process.core.models import load_yolo_model
 from process.core.cropper import crop_with_pad, is_box_too_small
-from process.core.classifier import TeamClassifier
+from process.core.team_classifier.pytorch_team_classifier import TeamClassifier
 from process.core.ema import init_track_memory, update_ema, decide_team
 from process.core.fallback import apply_fallback
 from process.core.drawer import draw_entity
@@ -31,7 +31,7 @@ from process.io.ffmpeg import cut_video, convert_video_to_safe_format
 from process.io.emailer import send_email
 
 print("\n==============================")
-print("   PROCESS VIDEO PIPELINE — versão limpa e estável")
+print("   PROCESS VIDEO PIPELINE — versão PyTorch")
 print("==============================\n")
 
 
@@ -68,11 +68,10 @@ def process_video(model, classifier, local_video, original_name):
 
     frame_index = 0
 
-    # memória temporal
     team_memory = {}
     last_team = {}
     fallback_counter = {}
-    track_votes = {}  # track_id -> lista de "A"/"B"
+    track_votes = {}
 
     while True:
         ret, frame = cap.read()
@@ -100,13 +99,11 @@ def process_video(model, classifier, local_video, original_name):
 
             track_id = int(box.id[0]) if box.id is not None else None
 
-            # árbitro
             if base_label == "referee":
                 label_str = draw_entity(frame, "referee", None, x1, y1, x2, y2)
                 labels_file.write(f"{frame_name} {label_str}\n")
                 continue
 
-            # bola
             if base_label == "ball":
                 label_str = draw_entity(frame, "ball", None, x1, y1, x2, y2)
                 labels_file.write(f"{frame_name} {label_str}\n")
@@ -141,7 +138,7 @@ def process_video(model, classifier, local_video, original_name):
             })
 
         # -----------------------------
-        # 2) CLASSIFICAÇÃO LIMPA
+        # 2) CLASSIFICAÇÃO PyTorch
         # -----------------------------
         for p in players:
             crop = p["crop"]
@@ -151,21 +148,12 @@ def process_video(model, classifier, local_video, original_name):
                 p["team_raw"] = None
                 continue
 
-            # classificador principal
-            team_cls, conf_cls = classifier.predict_with_confidence(crop)
-
-            if team_cls is not None and conf_cls >= 0.7:
-                team_raw = team_cls
-            else:
-                # fallback simples baseado em Hue médio
-                hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-                mean_hsv = hsv.reshape(-1, 3).mean(axis=0)
-                team_raw = "A" if mean_hsv[0] < 90 else "B"
+            team_raw = classifier.predict(crop)
+            team_raw = "A" if "A" in team_raw else "B"
 
             p["team_raw"] = team_raw
 
-            # votos por track_id
-            if track_id is not None and team_raw is not None:
+            if track_id is not None:
                 if track_id not in track_votes:
                     track_votes[track_id] = []
                 track_votes[track_id].append(team_raw)
@@ -181,7 +169,6 @@ def process_video(model, classifier, local_video, original_name):
             x1, y1, x2, y2 = p["x1"], p["y1"], p["x2"], p["y2"]
             team_raw = p["team_raw"]
 
-            # moda por track_id
             if track_id is not None:
                 history = track_votes.get(track_id, [])
                 if history:
@@ -217,14 +204,13 @@ def process_video(model, classifier, local_video, original_name):
 # -----------------------------
 def main():
     print("==============================")
-    print("   PROCESS VIDEO PIPELINE — versão limpa e estável")
+    print("   PROCESS VIDEO PIPELINE — versão PyTorch")
     print("==============================\n")
 
     model = load_yolo_model()
 
     classifier = None
     if USE_TEAM_CLASSIFIER:
-        load_team_classifier()
         classifier = TeamClassifier("bestclassifier.pt")
 
     files_all, files_videos = list_incoming()
