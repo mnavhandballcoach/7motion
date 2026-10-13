@@ -211,7 +211,9 @@ def main():
 
     classifier = None
     if USE_TEAM_CLASSIFIER:
-        classifier = TeamClassifier("bestclassifier.pt")
+        from process.core.models import load_team_classifier
+        model_path = load_team_classifier()   # descarrega bestclassifier.pt
+        classifier = TeamClassifier(model_path)
 
     files_all, files_videos = list_incoming()
     if not files_videos:
