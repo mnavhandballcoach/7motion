@@ -14,7 +14,7 @@ from ultralytics import YOLO
 from api.b2_client import hard_delete_file
 
 print("\n==============================")
-print("   PROCESS VIDEO PIPELINE — versão premium v2")
+print("   PROCESS VIDEO PIPELINE — versão premium v3 (AUTO‑MAPPING)")
 print("==============================\n")
 
 USE_TEAM_CLASSIFIER = True
@@ -171,21 +171,48 @@ def draw_ball(frame, x, y, w, h):
     cv2.circle(frame, (cx, cy), radius, COLOR_BALL, 2)
 
 # -------------------------------------------------------------
-# Team classifier parsing
+# AUTO‑MAPPING (equipas reais → Team A/B)
 # -------------------------------------------------------------
-def parse_team_classifier_label(label_str):
-    label_str = label_str.strip().lower()
-    if "team a" in label_str:
-        return "A"
-    if "team b" in label_str:
-        return "B"
+from collections import Counter
+
+team_counts = Counter()
+mapping = None
+AUTO_MAPPING_FRAMES = 200
+
+def auto_map_team(team_raw, frame_index):
+    global mapping
+
+    if frame_index < AUTO_MAPPING_FRAMES:
+        if team_raw is not None:
+            team_counts[team_raw] += 1
+        return None
+
+    if frame_index == AUTO_MAPPING_FRAMES:
+        most_common = team_counts.most_common(2)
+        if len(most_common) < 2:
+            print("⚠️ Não foi possível identificar duas equipas distintas.")
+            return None
+
+        teamA_real = most_common[0][0]
+        teamB_real = most_common[1][0]
+
+        mapping = {
+            teamA_real: "A",
+            teamB_real: "B"
+        }
+
+        print(f"🔧 AUTO‑MAPPING: {teamA_real} → A, {teamB_real} → B")
+
+    if mapping is not None:
+        return mapping.get(team_raw, None)
+
     return None
 
 # -------------------------------------------------------------
-# Core processing (versão premium v2)
+# Core processing (versão premium v3)
 # -------------------------------------------------------------
 def process_video(model, classifier, local_video, original_name):
-    print(f"🔍 Running YOLO + IMAGE CLASSIFIER + EMA v2 + CROP DINÂMICO + CONF ADAPT on {local_video}...")
+    print(f"🔍 Running YOLO + CLASSIFIER + AUTO‑MAPPING + EMA v3 on {local_video}...")
 
     cap = cv2.VideoCapture(local_video)
     fps = cap.get(cv2.CAP_PROP_FPS)
@@ -217,9 +244,9 @@ def process_video(model, classifier, local_video, original_name):
     frame_index = 0
 
     # EMA por classe + fallback cooldown
-    team_memory = {}       # track_id -> {"A": float, "B": float}
-    last_team = {}         # track_id -> "A"/"B"/None
-    fallback_counter = {}  # track_id -> int
+    team_memory = {}
+    last_team = {}
+    fallback_counter = {}
     EMA_ALPHA = 0.15
 
     while True:
@@ -256,23 +283,17 @@ def process_video(model, classifier, local_video, original_name):
                 labels_file.write(f"{frame_name} ball - {x1} {y1} {x2} {y2}\n")
                 continue
 
-            # Player / Goalkeeper
             role = base_label
             team_raw = None
 
-            # Inicializar memória EMA
             if track_id is not None and track_id not in team_memory:
                 team_memory[track_id] = {"A": 0.5, "B": 0.5}
                 fallback_counter[track_id] = 0
                 last_team[track_id] = None
 
-            # Ignorar caixas demasiado pequenas (pouca informação)
             if w_box < 40 or h_box < 60:
                 team_raw = None
             else:
-                # ------------------------------
-                # Crop dinâmico
-                # ------------------------------
                 pad = int(max(w_box, h_box) * 0.40)
                 pad = max(pad, 35)
 
@@ -283,9 +304,6 @@ def process_video(model, classifier, local_video, original_name):
 
                 crop = frame[y1p:y2p, x1p:x2p]
 
-                # ------------------------------
-                # Classificação de imagem
-                # ------------------------------
                 if USE_TEAM_CLASSIFIER and classifier is not None and crop.size > 0:
                     cls_results = classifier(crop)
 
@@ -293,32 +311,30 @@ def process_video(model, classifier, local_video, original_name):
                     conf = float(cls_results[0].probs.top1conf)
                     raw_label = classifier.names[team_idx]
 
-                    # Confiança mínima adaptativa
                     area_ratio = (w_box * h_box) / (w * h + 1e-6)
                     conf_min = 0.70 - area_ratio * 0.25
                     conf_min = max(0.45, conf_min)
 
                     if conf >= conf_min:
-                        team_raw = parse_team_classifier_label(raw_label)
+                        team_raw = raw_label  # equipa real (Sporting, Porto, etc.)
                     else:
                         team_raw = None
 
-            # ------------------------------
-            # EMA por classe
-            # ------------------------------
+            # AUTO‑MAPPING → A/B
+            team_mapped = auto_map_team(team_raw, frame_index)
+
+            # EMA
             if track_id is not None:
-                if team_raw == "A":
+                if team_mapped == "A":
                     team_memory[track_id]["A"] = EMA_ALPHA * 1.0 + (1 - EMA_ALPHA) * team_memory[track_id]["A"]
                     team_memory[track_id]["B"] = (1 - EMA_ALPHA) * team_memory[track_id]["B"]
-                elif team_raw == "B":
+                elif team_mapped == "B":
                     team_memory[track_id]["B"] = EMA_ALPHA * 1.0 + (1 - EMA_ALPHA) * team_memory[track_id]["B"]
                     team_memory[track_id]["A"] = (1 - EMA_ALPHA) * team_memory[track_id]["A"]
                 else:
-                    # sem nova info, apenas decai ligeiramente
                     team_memory[track_id]["A"] = (1 - EMA_ALPHA * 0.2) * team_memory[track_id]["A"]
                     team_memory[track_id]["B"] = (1 - EMA_ALPHA * 0.2) * team_memory[track_id]["B"]
 
-                # Decisão com zona neutra
                 if team_memory[track_id]["A"] > 0.65 and team_memory[track_id]["A"] > team_memory[track_id]["B"]:
                     team = "A"
                 elif team_memory[track_id]["B"] > 0.65 and team_memory[track_id]["B"] > team_memory[track_id]["A"]:
@@ -326,11 +342,9 @@ def process_video(model, classifier, local_video, original_name):
                 else:
                     team = None
             else:
-                team = team_raw
+                team = team_mapped
 
-            # ------------------------------
-            # Fallback com cooldown
-            # ------------------------------
+            # Fallback
             if track_id is not None:
                 if team is None:
                     if last_team[track_id] is not None and fallback_counter[track_id] < 15:
@@ -340,9 +354,7 @@ def process_video(model, classifier, local_video, original_name):
                     last_team[track_id] = team
                     fallback_counter[track_id] = 0
 
-            # ------------------------------
-            # Combinar YOLO + TeamClassifier
-            # ------------------------------
+            # Final label
             if team == "A":
                 final_label = f"{role.capitalize()} Team A"
                 color = COLOR_TEAM_A
@@ -376,7 +388,7 @@ def process_video(model, classifier, local_video, original_name):
 # Main
 # -------------------------------------------------------------
 def main():
-    print(">>> USING process_video — versão premium v2 <<<")
+    print(">>> USING process_video — versão premium v3 (AUTO‑MAPPING) <<<")
 
     model_path = download_model(MODEL_URL, "best.pt")
     model = YOLO(model_path)
