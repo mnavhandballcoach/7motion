@@ -5,11 +5,9 @@ on:
     branches:
       - main
 
-  # 🔥 Corre automaticamente a cada 30 minutos
   schedule:
     - cron: "*/30 * * * *"
 
-  # 🔥 Permite correr manualmente
   workflow_dispatch:
 
 jobs:
