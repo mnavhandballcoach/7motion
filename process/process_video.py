@@ -23,66 +23,50 @@ from process.core.cropper import crop_with_pad, is_box_too_small
 from process.core.ema import init_track_memory, update_ema, decide_team
 from process.core.fallback import apply_fallback
 from process.core.drawer import draw_entity
-
-
 from process.io.storage import list_incoming, download_video_and_json, upload_file, delete_incoming
 from process.io.ffmpeg import cut_video, convert_video_to_safe_format
 from process.io.emailer import send_email
-
 
 print("\n==============================")
 print("   PROCESS VIDEO PIPELINE — clusterização + temporal")
 print("==============================\n")
 
-
-
-
 # -----------------------------
 # Clusterização por cores (Hue + Saturação)
 # -----------------------------
 def extract_jersey_feature(crop):
-    # crop central da camisola
     h, w, _ = crop.shape
-    y1, y2 = int(h * 0.25), int(h * 0.75)
-    x1, x2 = int(w * 0.25), int(w * 0.75)
 
+    # crop mais focado na zona da camisola (verticalmente mais baixo)
+    y1, y2 = int(h * 0.35), int(h * 0.85)
+    x1, x2 = int(w * 0.20), int(w * 0.80)
 
     jersey = crop[y1:y2, x1:x2]
-
 
     hsv = cv2.cvtColor(jersey, cv2.COLOR_BGR2HSV)
     h_channel = hsv[:, :, 0]
     s_channel = hsv[:, :, 1]
     v_channel = hsv[:, :, 2]
 
-
-    # máscara para apanhar só pixels da camisola
-    mask = (s_channel > 60) & (v_channel > 50)
-
+    # máscara mais agressiva para remover tudo exceto camisola
+    mask = (
+        (s_channel > 70) &        # saturação alta → remove pele e branco
+        (v_channel > 40) &        # remove sombras
+        (v_channel < 220)         # remove chão azul brilhante
+    )
 
     filtered_hue = h_channel[mask]
     filtered_sat = s_channel[mask]
 
-
-    # fallback seguro
-    if len(filtered_hue) == 0:
+    if len(filtered_hue) < 50:   # se poucos pixels → crop falhou
         return np.array([0.0, 0.0], dtype=np.float32)
-
-
-    # histograma do Hue → cor dominante
+        
+    # histograma do Hue
     hist, _ = np.histogram(filtered_hue, bins=180, range=(0, 180))
     dominant_hue = float(np.argmax(hist))
-
-
-    # saturação média → distingue azul/branco
     mean_sat = float(filtered_sat.mean())
 
-
-    # feature 2D
     return np.array([dominant_hue, mean_sat], dtype=np.float32)
-
-
-
 
 def cluster_players_kmeans(features):
     if len(features) == 0:
