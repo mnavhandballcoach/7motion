@@ -29,7 +29,46 @@ print("   PROCESS VIDEO PIPELINE — clusterização + temporal")
 print("==============================\n")
 
 # -----------------------------
-# Clusterização por cores (Hue + Saturação)
+# BBSL — Bounding Box Stabilization Layer
+# -----------------------------
+def stabilize_bbox(track_id, x1, y1, x2, y2, bbox_memory, max_history=8):
+    if track_id is None:
+        return x1, y1, x2, y2
+
+    if track_id not in bbox_memory:
+        bbox_memory[track_id] = []
+
+    bbox_memory[track_id].append((x1, y1, x2, y2))
+    if len(bbox_memory[track_id]) > max_history:
+        bbox_memory[track_id].pop(0)
+
+    xs1 = [b[0] for b in bbox_memory[track_id]]
+    ys1 = [b[1] for b in bbox_memory[track_id]]
+    xs2 = [b[2] for b in bbox_memory[track_id]]
+    ys2 = [b[3] for b in bbox_memory[track_id]]
+
+    sx1 = int(np.median(xs1))
+    sy1 = int(np.median(ys1))
+    sx2 = int(np.median(xs2))
+    sy2 = int(np.median(ys2))
+
+    w_box = sx2 - sx1
+    h_box = sy2 - sy1
+
+    shrink_x = int(w_box * 0.10)
+    shrink_y_top = int(h_box * 0.15)
+    shrink_y_bottom = int(h_box * 0.10)
+
+    sx1 += shrink_x
+    sx2 -= shrink_x
+    sy1 += shrink_y_top
+    sy2 -= shrink_y_bottom
+
+    return sx1, sy1, sx2, sy2
+
+
+# -----------------------------
+# Crop Adaptativo (Versão C)
 # -----------------------------
 def crop_jersey_only(frame, x1, y1, x2, y2):
     h_frame, w_frame, _ = frame.shape
@@ -86,6 +125,9 @@ def crop_jersey_only(frame, x1, y1, x2, y2):
     return jersey_crop
 
 
+# -----------------------------
+# Feature Hue + Saturação
+# -----------------------------
 def extract_jersey_feature(crop):
     if crop is None or crop.size == 0:
         return np.array([0.0, 0.0], dtype=np.float32)
@@ -163,7 +205,8 @@ def process_video(model, local_video, original_name):
     last_team = {}
     fallback_counter = {}
 
-    cluster_memory = {}  # track_id -> lista de "A"/"B"
+    cluster_memory = {}
+    bbox_memory = {}  # ⭐ NOVO
 
     CLASSIFY_CLASSES = ("player", "goalkeeper")
 
@@ -189,10 +232,13 @@ def process_video(model, local_video, original_name):
             base_label = model.names[cls].lower()
 
             x1, y1, x2, y2 = map(int, box.xyxy[0])
+            track_id = int(box.id[0]) if box.id is not None else None
+
+            # ⭐ BBSL aplicado aqui
+            x1, y1, x2, y2 = stabilize_bbox(track_id, x1, y1, x2, y2, bbox_memory)
+
             w_box = x2 - x1
             h_box = y2 - y1
-
-            track_id = int(box.id[0]) if box.id is not None else None
 
             if base_label == "referee":
                 label_str = draw_entity(frame, "referee", None, x1, y1, x2, y2)
@@ -260,7 +306,7 @@ def process_video(model, local_video, original_name):
                 p["team_raw"] = None
 
         # -----------------------------
-        # 3) MEMÓRIA TEMPORAL DE CLUSTERIZAÇÃO
+        # 3) MEMÓRIA TEMPORAL
         # -----------------------------
         for p in players:
             track_id = p["track_id"]
