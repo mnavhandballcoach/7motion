@@ -68,6 +68,26 @@ def extract_jersey_feature(crop):
 
     return np.array([dominant_hue, mean_sat], dtype=np.float32)
 
+def crop_jersey_only(frame, x1, y1, x2, y2):
+    w_box = x2 - x1
+    h_box = y2 - y1
+
+
+    # reduzir bounding box para zona da camisola
+    new_y1 = y1 + int(h_box * 0.25)
+    new_y2 = y1 + int(h_box * 0.75)
+    new_x1 = x1 + int(w_box * 0.20)
+    new_x2 = x1 + int(w_box * 0.80)
+
+
+    new_y1 = max(new_y1, 0)
+    new_y2 = min(new_y2, frame.shape[0])
+    new_x1 = max(new_x1, 0)
+    new_x2 = min(new_x2, frame.shape[1])
+
+
+    return frame[new_y1:new_y2, new_x1:new_x2]
+
 def cluster_players_kmeans(features):
     if len(features) == 0:
         return []
@@ -207,7 +227,7 @@ def process_video(model, local_video, original_name):
                 continue
 
 
-            crop, _ = crop_with_pad(frame, x1, y1, x2, y2, w, h)
+            crop, _ = crop_jersey_only(frame, x1, y1, x2, y2, w, h)
 
 
             players.append({
