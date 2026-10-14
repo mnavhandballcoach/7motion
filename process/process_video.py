@@ -227,7 +227,7 @@ def process_video(model, local_video, original_name):
                 continue
 
 
-            crop, _ = crop_jersey_only(frame, x1, y1, x2, y2, w, h)
+            crop, _ = crop_jersey_only(frame, x1, y1, x2, y2)
 
 
             players.append({
