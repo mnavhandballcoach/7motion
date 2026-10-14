@@ -38,30 +38,48 @@ print("==============================\n")
 
 
 # -----------------------------
-# Clusterização por cores (KMeans)
+# Clusterização por cores (Hue + Saturação)
 # -----------------------------
 def extract_jersey_feature(crop):
-    # crop central da camisola (remove cabeça, braços, fundo)
+    # crop central da camisola
     h, w, _ = crop.shape
-    y1 = int(h * 0.25)
-    y2 = int(h * 0.75)
-    x1 = int(w * 0.25)
-    x2 = int(w * 0.75)
+    y1, y2 = int(h * 0.25), int(h * 0.75)
+    x1, x2 = int(w * 0.25), int(w * 0.75)
 
 
     jersey = crop[y1:y2, x1:x2]
 
 
-    # converter para HSV
     hsv = cv2.cvtColor(jersey, cv2.COLOR_BGR2HSV)
+    h_channel = hsv[:, :, 0]
+    s_channel = hsv[:, :, 1]
+    v_channel = hsv[:, :, 2]
 
 
-    # usar só o canal Hue (0–180)
-    hue = hsv[:, :, 0]
+    # máscara para apanhar só pixels da camisola
+    mask = (s_channel > 60) & (v_channel > 50)
 
 
-    # média do Hue → feature forte para clusterização
-    return float(hue.mean())
+    filtered_hue = h_channel[mask]
+    filtered_sat = s_channel[mask]
+
+
+    # fallback seguro
+    if len(filtered_hue) == 0:
+        return np.array([0.0, 0.0], dtype=np.float32)
+
+
+    # histograma do Hue → cor dominante
+    hist, _ = np.histogram(filtered_hue, bins=180, range=(0, 180))
+    dominant_hue = float(np.argmax(hist))
+
+
+    # saturação média → distingue azul/branco
+    mean_sat = float(filtered_sat.mean())
+
+
+    # feature 2D
+    return np.array([dominant_hue, mean_sat], dtype=np.float32)
 
 
 
@@ -73,7 +91,7 @@ def cluster_players_kmeans(features):
         return [0]
 
 
-    X = np.array(features).reshape(-1, 1)
+    X = np.stack(features, axis=0)  # Nx2
     kmeans = KMeans(n_clusters=2, n_init="auto", random_state=42)
     labels = kmeans.fit_predict(X)
     return labels.tolist()
