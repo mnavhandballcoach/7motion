@@ -122,6 +122,10 @@ def process_video(model, classifier, local_video, original_name):
             # guarda-redes (não classifica equipas)
             if base_label == "goalkeeper":
                 crop, _ = crop_with_pad(frame, x1, y1, x2, y2, w, h)
+
+                # GUARDA SEMPRE O CROP
+                save_debug_crop(crop, frame_index, track_id, "goalkeeper", 1.0)
+
                 players.append({
                     "role": "goalkeeper",
                     "track_id": track_id,
@@ -154,6 +158,9 @@ def process_video(model, classifier, local_video, original_name):
 
             crop, _ = crop_with_pad(frame, x1, y1, x2, y2, w, h)
 
+            # GUARDA SEMPRE O CROP
+            save_debug_crop(crop, frame_index, track_id, "raw", 0.0)
+
             players.append({
                 "role": "player",
                 "track_id": track_id,
@@ -180,7 +187,7 @@ def process_video(model, classifier, local_video, original_name):
                 p["cls_name"] = cls_name
                 p["conf"] = conf
 
-                # guardar crop para debug
+                # GUARDA SEMPRE O CROP CLASSIFICADO
                 save_debug_crop(crop, frame_index, p["track_id"], cls_name, conf)
 
                 if conf >= 0.60:
