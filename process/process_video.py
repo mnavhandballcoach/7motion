@@ -1,7 +1,8 @@
 # ============================
 # Toggles
 # ============================
-USE_CLUSTERING = True  # ativa clusterização por cores (KMeans)
+USE_TEAM_CLASSIFIER = True       # ativa o classificador de equipas
+USE_CLUSTERING = False           # ativa clusterização por cores (KMeans) se não houver classificador
 
 import sys
 import os
@@ -15,145 +16,28 @@ from sklearn.cluster import KMeans
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from process.core.models import load_yolo_model
-from process.core.cropper import is_box_too_small
+from process.core.models import load_yolo_model, load_team_classifier
+from process.core.cropper import crop_with_pad, is_box_too_small
 from process.core.ema import init_track_memory, update_ema, decide_team
 from process.core.fallback import apply_fallback
 from process.core.drawer import draw_entity
+
 from process.io.storage import list_incoming, download_video_and_json, upload_file, delete_incoming
 from process.io.ffmpeg import cut_video, convert_video_to_safe_format
 from process.io.emailer import send_email
 
 print("\n==============================")
-print("   PROCESS VIDEO PIPELINE — clusterização + temporal")
+print("   PROCESS VIDEO PIPELINE — classifier + temporal")
 print("==============================\n")
 
-# -----------------------------
-# BBSL — Bounding Box Stabilization Layer
-# -----------------------------
-def stabilize_bbox(track_id, x1, y1, x2, y2, bbox_memory, max_history=8):
-    if track_id is None:
-        return x1, y1, x2, y2
-
-    if track_id not in bbox_memory:
-        bbox_memory[track_id] = []
-
-    bbox_memory[track_id].append((x1, y1, x2, y2))
-    if len(bbox_memory[track_id]) > max_history:
-        bbox_memory[track_id].pop(0)
-
-    xs1 = [b[0] for b in bbox_memory[track_id]]
-    ys1 = [b[1] for b in bbox_memory[track_id]]
-    xs2 = [b[2] for b in bbox_memory[track_id]]
-    ys2 = [b[3] for b in bbox_memory[track_id]]
-
-    sx1 = int(np.median(xs1))
-    sy1 = int(np.median(ys1))
-    sx2 = int(np.median(xs2))
-    sy2 = int(np.median(ys2))
-
-    w_box = sx2 - sx1
-    h_box = sy2 - sy1
-
-    shrink_x = int(w_box * 0.10)
-    shrink_y_top = int(h_box * 0.15)
-    shrink_y_bottom = int(h_box * 0.10)
-
-    sx1 += shrink_x
-    sx2 -= shrink_x
-    sy1 += shrink_y_top
-    sy2 -= shrink_y_bottom
-
-    return sx1, sy1, sx2, sy2
-
 
 # -----------------------------
-# Crop Adaptativo (Versão C)
-# -----------------------------
-def crop_jersey_only(frame, x1, y1, x2, y2):
-    h_frame, w_frame, _ = frame.shape
-
-    x1 = max(0, x1)
-    y1 = max(0, y1)
-    x2 = min(w_frame, x2)
-    y2 = min(h_frame, y2)
-
-    box = frame[y1:y2, x1:x2]
-    if box.size == 0:
-        return box
-
-    hsv = cv2.cvtColor(box, cv2.COLOR_BGR2HSV)
-    h_channel = hsv[:, :, 0]
-    s_channel = hsv[:, :, 1]
-    v_channel = hsv[:, :, 2]
-
-    mask = (
-        (s_channel > 70) &
-        (v_channel > 40) &
-        (v_channel < 220)
-    )
-
-    if mask.sum() < 50:
-        h_box, w_box, _ = box.shape
-        ny1 = int(h_box * 0.25)
-        ny2 = int(h_box * 0.75)
-        nx1 = int(w_box * 0.20)
-        nx2 = int(w_box * 0.80)
-        return box[ny1:ny2, nx1:nx2]
-
-    mask_uint8 = mask.astype(np.uint8) * 255
-    contours, _ = cv2.findContours(mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        h_box, w_box, _ = box.shape
-        ny1 = int(h_box * 0.25)
-        ny2 = int(h_box * 0.75)
-        nx1 = int(w_box * 0.20)
-        nx2 = int(w_box * 0.80)
-        return box[ny1:ny2, nx1:nx2]
-
-    c = max(contours, key=cv2.contourArea)
-    x, y, w, h = cv2.boundingRect(c)
-
-    pad_x = int(w * 0.05)
-    pad_y = int(h * 0.05)
-    x0 = max(0, x - pad_x)
-    y0 = max(0, y - pad_y)
-    x1b = min(box.shape[1], x + w + pad_x)
-    y1b = min(box.shape[0], y + h + pad_y)
-
-    jersey_crop = box[y0:y1b, x0:x1b]
-    return jersey_crop
-
-
-# -----------------------------
-# Feature Hue + Saturação
+# Clusterização por cores (KMeans)
 # -----------------------------
 def extract_jersey_feature(crop):
-    if crop is None or crop.size == 0:
-        return np.array([0.0, 0.0], dtype=np.float32)
-
     hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-    h_channel = hsv[:, :, 0]
-    s_channel = hsv[:, :, 1]
-    v_channel = hsv[:, :, 2]
-
-    mask = (
-        (s_channel > 70) &
-        (v_channel > 40) &
-        (v_channel < 220)
-    )
-
-    filtered_hue = h_channel[mask]
-    filtered_sat = s_channel[mask]
-
-    if len(filtered_hue) < 50:
-        return np.array([0.0, 0.0], dtype=np.float32)
-
-    hist, _ = np.histogram(filtered_hue, bins=180, range=(0, 180))
-    dominant_hue = float(np.argmax(hist))
-    mean_sat = float(filtered_sat.mean())
-
-    return np.array([dominant_hue, mean_sat], dtype=np.float32)
+    mean_hsv = hsv.reshape(-1, 3).mean(axis=0)
+    return mean_hsv.astype(np.float32)
 
 
 def cluster_players_kmeans(features):
@@ -171,7 +55,7 @@ def cluster_players_kmeans(features):
 # -----------------------------
 # PROCESS VIDEO
 # -----------------------------
-def process_video(model, local_video, original_name):
+def process_video(model, classifier, local_video, original_name):
     cap = cv2.VideoCapture(local_video)
     fps = cap.get(cv2.CAP_PROP_FPS)
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -205,8 +89,8 @@ def process_video(model, local_video, original_name):
     last_team = {}
     fallback_counter = {}
 
-    cluster_memory = {}
-    bbox_memory = {}  # ⭐ NOVO
+    # memória temporal por track_id
+    cluster_memory = {}  # track_id -> lista de "A"/"B"
 
     CLASSIFY_CLASSES = ("player", "goalkeeper")
 
@@ -232,19 +116,18 @@ def process_video(model, local_video, original_name):
             base_label = model.names[cls].lower()
 
             x1, y1, x2, y2 = map(int, box.xyxy[0])
-            track_id = int(box.id[0]) if box.id is not None else None
-
-            # ⭐ BBSL aplicado aqui
-            x1, y1, x2, y2 = stabilize_bbox(track_id, x1, y1, x2, y2, bbox_memory)
-
             w_box = x2 - x1
             h_box = y2 - y1
 
+            track_id = int(box.id[0]) if box.id is not None else None
+
+            # árbitro
             if base_label == "referee":
                 label_str = draw_entity(frame, "referee", None, x1, y1, x2, y2)
                 labels_file.write(f"{frame_name} {label_str}\n")
                 continue
 
+            # bola
             if base_label == "ball":
                 label_str = draw_entity(frame, "ball", None, x1, y1, x2, y2)
                 labels_file.write(f"{frame_name} {label_str}\n")
@@ -269,7 +152,7 @@ def process_video(model, local_video, original_name):
                 })
                 continue
 
-            crop = crop_jersey_only(frame, x1, y1, x2, y2)
+            crop, _ = crop_with_pad(frame, x1, y1, x2, y2, w, h)
 
             players.append({
                 "role": role,
@@ -281,9 +164,19 @@ def process_video(model, local_video, original_name):
             })
 
         # -----------------------------
-        # 2) CLUSTERIZAÇÃO
+        # 2) CLASSIFICADOR OU CLUSTERIZAÇÃO
         # -----------------------------
-        if USE_CLUSTERING:
+        if classifier is not None and USE_TEAM_CLASSIFIER:
+            # usar o modelo de equipamentos
+            for p in players:
+                if p["crop"] is None:
+                    p["team_raw"] = None
+                    continue
+                pred = classifier.predict(p["crop"])
+                p["team_raw"] = pred
+
+        elif USE_CLUSTERING:
+            # fallback: clusterização por cor
             for p in players:
                 if p["crop"] is None:
                     continue
@@ -301,7 +194,9 @@ def process_video(model, local_video, original_name):
                 cluster_id = cluster_labels[idx]
                 idx += 1
                 p["team_raw"] = "A" if cluster_id == 0 else "B"
+
         else:
+            # sem classificador e sem clusterização: nada
             for p in players:
                 p["team_raw"] = None
 
@@ -328,6 +223,7 @@ def process_video(model, local_video, original_name):
             x1, y1, x2, y2 = p["x1"], p["y1"], p["x2"], p["y2"]
             team_raw = p["team_raw"]
 
+            # decisão temporal por maioria dos últimos 10 frames
             if track_id is not None:
                 history = cluster_memory.get(track_id, [])
                 if history:
@@ -337,6 +233,7 @@ def process_video(model, local_video, original_name):
             else:
                 team_temporal = team_raw
 
+            # EMA + fallback
             if track_id is not None:
                 update_ema(team_memory, track_id, team_temporal)
                 team = decide_team(team_memory, track_id)
@@ -363,11 +260,16 @@ def process_video(model, local_video, original_name):
 # -----------------------------
 def main():
     print("==============================")
-    print("   PROCESS VIDEO PIPELINE — clusterização + temporal")
+    print("   PROCESS VIDEO PIPELINE — classifier + temporal")
     print("==============================\n")
-    print(">>> USING process_video — clusterização + toggles <<<")
+    print(">>> USING process_video — classificador de equipamentos <<<")
 
     model = load_yolo_model()
+
+    classifier = None
+    if USE_TEAM_CLASSIFIER:
+        # usa o loader que já criaste para o modelo de equipamentos
+        classifier = load_team_classifier()
 
     files_all, files_videos = list_incoming()
     if not files_videos:
@@ -396,7 +298,7 @@ def main():
         safe_video = convert_video_to_safe_format(cut_path)
 
         output_video, frames_dir, labels_path = process_video(
-            model, safe_video, os.path.basename(key)
+            model, classifier, safe_video, os.path.basename(key)
         )
 
         annotated_remote = f"processed/{os.path.basename(output_video)}"
@@ -441,6 +343,11 @@ def main():
         shutil.rmtree("output_frames", ignore_errors=True)
         shutil.rmtree("output_labels", ignore_errors=True)
 
+        os.remove(local_video)
+        os.remove(safe_video)
+        os.remove(local_json)
+
 
 if __name__ == "__main__":
     main()
+
