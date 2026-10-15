@@ -2,7 +2,7 @@
 # Toggles
 # ============================
 USE_TEAM_CLASSIFIER = True       # ativa o classificador de equipas
-USE_CLUSTERING = False           # ativa clusterização por cores (KMeans) se não houver classificador
+USE_CLUSTERING = False           # ativa clusterização por cores (KMeans)
 
 import sys
 import os
@@ -18,6 +18,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from process.core.models import load_yolo_model, load_team_classifier
 from process.core.cropper import crop_with_pad, is_box_too_small
+from process.core.classifier import TeamClassifier
 from process.core.ema import init_track_memory, update_ema, decide_team
 from process.core.fallback import apply_fallback
 from process.core.drawer import draw_entity
@@ -268,8 +269,9 @@ def main():
 
     classifier = None
     if USE_TEAM_CLASSIFIER:
-        # usa o loader que já criaste para o modelo de equipamentos
-        classifier = load_team_classifier()
+        # load_team_classifier devolve APENAS o caminho
+        classifier_path = load_team_classifier()
+        classifier = TeamClassifier(classifier_path)
 
     files_all, files_videos = list_incoming()
     if not files_videos:
@@ -350,4 +352,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
