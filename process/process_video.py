@@ -20,9 +20,17 @@ from process.io.emailer import send_email
 
 
 # ============================================================
-# DEBUG: guardar crops para ver o que o classificador recebe
+# UPLOAD DE CROPS PARA BACKBLAZE
 # ============================================================
-def save_debug_crop(crop, frame_index, track_id, cls_name=None, conf=None):
+def upload_debug_crop(local_path, video_id, frame_index, filename):
+    remote_path = f"processed/crops/{video_id}/frame_{frame_index:05d}/{filename}"
+    upload_file(local_path, remote_path)
+
+
+# ============================================================
+# GUARDAR + ENVIAR CROP
+# ============================================================
+def save_debug_crop(crop, frame_index, track_id, cls_name=None, conf=None, video_id=None):
     if crop is None:
         return
 
@@ -34,12 +42,15 @@ def save_debug_crop(crop, frame_index, track_id, cls_name=None, conf=None):
     else:
         fname = f"track_{track_id}.jpg"
 
-    path = os.path.join(debug_dir, fname)
-    cv2.imwrite(path, crop)
+    local_path = os.path.join(debug_dir, fname)
+    cv2.imwrite(local_path, crop)
+
+    if video_id is not None:
+        upload_debug_crop(local_path, video_id, frame_index, fname)
 
 
 # ============================================================
-# PROCESS VIDEO
+# PROCESSAMENTO DO VÍDEO
 # ============================================================
 def process_video(model, classifier, local_video, original_name):
 
@@ -72,14 +83,13 @@ def process_video(model, classifier, local_video, original_name):
 
     frame_index = 0
 
-    # memória temporal
     team_memory = {}
     last_team = {}
     fallback_counter = {}
-    cluster_memory = {}  # track_id → lista de A/B
+    cluster_memory = {}
 
     CLASSIFY_CLASSES = ("player",)
-    team_map = {}  # classe → A/B
+    team_map = {}
 
     while True:
         ret, frame = cap.read()
@@ -96,7 +106,7 @@ def process_video(model, classifier, local_video, original_name):
         frame_classes_raw = []
 
         # ============================================================
-        # 1) DETEÇÃO
+        # DETEÇÃO
         # ============================================================
         for box in detections:
             cls = int(box.cls[0])
@@ -119,12 +129,10 @@ def process_video(model, classifier, local_video, original_name):
                 labels_file.write(f"{frame_name} {label_str}\n")
                 continue
 
-            # guarda-redes (não classifica equipas)
+            # guarda-redes
             if base_label == "goalkeeper":
                 crop, _ = crop_with_pad(frame, x1, y1, x2, y2, w, h)
-
-                # GUARDA SEMPRE O CROP
-                save_debug_crop(crop, frame_index, track_id, "goalkeeper", 1.0)
+                save_debug_crop(crop, frame_index, track_id, "goalkeeper", 1.0, base_name)
 
                 players.append({
                     "role": "goalkeeper",
@@ -137,7 +145,7 @@ def process_video(model, classifier, local_video, original_name):
                 })
                 continue
 
-            # só jogadores entram no classificador
+            # só jogadores
             if base_label not in CLASSIFY_CLASSES:
                 continue
 
@@ -157,9 +165,7 @@ def process_video(model, classifier, local_video, original_name):
                 continue
 
             crop, _ = crop_with_pad(frame, x1, y1, x2, y2, w, h)
-
-            # GUARDA SEMPRE O CROP
-            save_debug_crop(crop, frame_index, track_id, "raw", 0.0)
+            save_debug_crop(crop, frame_index, track_id, "raw", 0.0, base_name)
 
             players.append({
                 "role": "player",
@@ -172,7 +178,7 @@ def process_video(model, classifier, local_video, original_name):
             })
 
         # ============================================================
-        # 2) CLASSIFICADOR
+        # CLASSIFICADOR
         # ============================================================
         if classifier is not None:
             for p in players:
@@ -187,14 +193,13 @@ def process_video(model, classifier, local_video, original_name):
                 p["cls_name"] = cls_name
                 p["conf"] = conf
 
-                # GUARDA SEMPRE O CROP CLASSIFICADO
-                save_debug_crop(crop, frame_index, p["track_id"], cls_name, conf)
+                save_debug_crop(crop, frame_index, p["track_id"], cls_name, conf, base_name)
 
                 if conf >= 0.60:
                     frame_classes_raw.append(cls_name)
 
         # ============================================================
-        # 3) Descobrir equipas dominantes no frame
+        # EQUIPAS DOMINANTES
         # ============================================================
         frame_team_classes = []
         if frame_classes_raw:
@@ -202,7 +207,6 @@ def process_video(model, classifier, local_video, original_name):
             most_common = counts.most_common(2)
             frame_team_classes = [c[0] for c in most_common]
 
-        # mapear classes → A/B
         for cls_name in frame_team_classes:
             if cls_name not in team_map:
                 if len(team_map) == 0:
@@ -211,7 +215,7 @@ def process_video(model, classifier, local_video, original_name):
                     team_map[cls_name] = "B"
 
         # ============================================================
-        # 4) Atribuir A/B aos jogadores
+        # ATRIBUIR EQUIPA RAW
         # ============================================================
         for p in players:
             if p["role"] != "player":
@@ -233,7 +237,7 @@ def process_video(model, classifier, local_video, original_name):
                 p["team_raw"] = team_map[cls_name]
 
         # ============================================================
-        # 5) Memória temporal (cluster_memory)
+        # MEMÓRIA TEMPORAL
         # ============================================================
         for p in players:
             if p["role"] != "player":
@@ -248,7 +252,7 @@ def process_video(model, classifier, local_video, original_name):
                     cluster_memory[track_id].pop(0)
 
         # ============================================================
-        # 6) EMA + fallback + decisão final
+        # EMA + FALLBACK
         # ============================================================
         frame_player_teams = []
 
@@ -275,7 +279,7 @@ def process_video(model, classifier, local_video, original_name):
                 label_str = draw_entity(frame, role, team, x1, y1, x2, y2)
                 labels_file.write(f"{frame_name} {label_str}\n")
 
-        # equipa dominante → guarda-redes
+        # guarda-redes → equipa dominante
         majority_team = None
         if frame_player_teams:
             countA = frame_player_teams.count("A")
