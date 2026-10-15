@@ -3,7 +3,7 @@ import requests
 from ultralytics import YOLO
 
 MODEL_URL = "https://github.com/mnavhandballcoach/7motion/releases/download/models/best.pt"
-CLASSIFIER_URL = "https://github.com/mnavhandballcoach/7motion/releases/download/models/bestclassifier.pt"
+CLASSIFIER_URL = "https://github.com/mnavhandballcoach/7motion/releases/download/models/bestclassifierv2.pt"
 
 def download_file(url, local_path):
     print(f"Downloading model from {url} ...")
