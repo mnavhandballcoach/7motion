@@ -1,21 +1,9 @@
-# ============================
-# Toggles
-# ============================
-USE_TEAM_CLASSIFIER = True
-USE_CLUSTERING = False
-
-import sys
 import os
 import cv2
-import shutil
 import json
-import requests
+import shutil
 import numpy as np
 from collections import Counter
-from sklearn.cluster import KMeans
-
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from process.core.models import load_yolo_model, load_team_classifier
 from process.core.cropper import crop_with_pad, is_box_too_small
@@ -24,40 +12,37 @@ from process.core.ema import init_track_memory, update_ema, decide_team
 from process.core.fallback import apply_fallback
 from process.core.drawer import draw_entity
 
-from process.io.storage import list_incoming, download_video_and_json, upload_file, delete_incoming
+from process.io.storage import (
+    list_incoming, download_video_and_json, upload_file, delete_incoming
+)
 from process.io.ffmpeg import cut_video, convert_video_to_safe_format
 from process.io.emailer import send_email
 
-print("\n==============================")
-print("   PROCESS VIDEO PIPELINE — classifier + temporal + robust teams")
-print("==============================\n")
+
+# ============================================================
+# DEBUG: guardar crops para ver o que o classificador recebe
+# ============================================================
+def save_debug_crop(crop, frame_index, track_id, cls_name=None, conf=None):
+    if crop is None:
+        return
+
+    debug_dir = os.path.join("debug_crops", f"frame_{frame_index:05d}")
+    os.makedirs(debug_dir, exist_ok=True)
+
+    if cls_name is not None:
+        fname = f"track_{track_id}_{cls_name}_{conf:.2f}.jpg"
+    else:
+        fname = f"track_{track_id}.jpg"
+
+    path = os.path.join(debug_dir, fname)
+    cv2.imwrite(path, crop)
 
 
-# -----------------------------
-# Clusterização por cores (KMeans) — opcional
-# -----------------------------
-def extract_jersey_feature(crop):
-    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-    mean_hsv = hsv.reshape(-1, 3).mean(axis=0)
-    return mean_hsv.astype(np.float32)
-
-
-def cluster_players_kmeans(features):
-    if len(features) == 0:
-        return []
-    if len(features) == 1:
-        return [0]
-
-    X = np.stack(features, axis=0)
-    kmeans = KMeans(n_clusters=2, n_init="auto", random_state=42)
-    labels = kmeans.fit_predict(X)
-    return labels.tolist()
-
-
-# -----------------------------
+# ============================================================
 # PROCESS VIDEO
-# -----------------------------
+# ============================================================
 def process_video(model, classifier, local_video, original_name):
+
     cap = cv2.VideoCapture(local_video)
     fps = cap.get(cv2.CAP_PROP_FPS)
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -87,17 +72,14 @@ def process_video(model, classifier, local_video, original_name):
 
     frame_index = 0
 
+    # memória temporal
     team_memory = {}
     last_team = {}
     fallback_counter = {}
+    cluster_memory = {}  # track_id → lista de A/B
 
-    cluster_memory = {}  # track_id -> lista de "A"/"B"
-
-    # só jogadores entram no classificador de equipas
     CLASSIFY_CLASSES = ("player",)
-
-    # Mapeamento global das classes do classificador → A/B (não muda ao longo do jogo)
-    team_map = {}
+    team_map = {}  # classe → A/B
 
     while True:
         ret, frame = cap.read()
@@ -111,11 +93,11 @@ def process_video(model, classifier, local_video, original_name):
         frame_path = os.path.join(frames_dir, frame_name)
 
         players = []
-        frame_classes_raw = []  # classes brutas deste frame (para descobrir as 2 equipas)
+        frame_classes_raw = []
 
-        # -----------------------------
+        # ============================================================
         # 1) DETEÇÃO
-        # -----------------------------
+        # ============================================================
         for box in detections:
             cls = int(box.cls[0])
             base_label = model.names[cls].lower()
@@ -123,22 +105,21 @@ def process_video(model, classifier, local_video, original_name):
             x1, y1, x2, y2 = map(int, box.xyxy[0])
             w_box = x2 - x1
             h_box = y2 - y1
-
             track_id = int(box.id[0]) if box.id is not None else None
 
+            # árbitro
             if base_label == "referee":
                 label_str = draw_entity(frame, "referee", None, x1, y1, x2, y2)
                 labels_file.write(f"{frame_name} {label_str}\n")
                 continue
 
+            # bola
             if base_label == "ball":
                 label_str = draw_entity(frame, "ball", None, x1, y1, x2, y2)
                 labels_file.write(f"{frame_name} {label_str}\n")
                 continue
 
-            role = base_label
-
-            # guarda-redes não entram no classificador de equipas
+            # guarda-redes (não classifica equipas)
             if base_label == "goalkeeper":
                 crop, _ = crop_with_pad(frame, x1, y1, x2, y2, w, h)
                 players.append({
@@ -146,13 +127,13 @@ def process_video(model, classifier, local_video, original_name):
                     "track_id": track_id,
                     "x1": x1, "y1": y1, "x2": x2, "y2": y2,
                     "crop": crop,
-                    "feature": None,
                     "team_raw": None,
                     "cls_name": None,
                     "conf": None,
                 })
                 continue
 
+            # só jogadores entram no classificador
             if base_label not in CLASSIFY_CLASSES:
                 continue
 
@@ -161,10 +142,9 @@ def process_video(model, classifier, local_video, original_name):
 
             if is_box_too_small(w_box, h_box):
                 players.append({
-                    "role": role,
+                    "role": "player",
                     "track_id": track_id,
                     "x1": x1, "y1": y1, "x2": x2, "y2": y2,
-                    "feature": None,
                     "crop": None,
                     "team_raw": None,
                     "cls_name": None,
@@ -175,95 +155,57 @@ def process_video(model, classifier, local_video, original_name):
             crop, _ = crop_with_pad(frame, x1, y1, x2, y2, w, h)
 
             players.append({
-                "role": role,
+                "role": "player",
                 "track_id": track_id,
                 "x1": x1, "y1": y1, "x2": x2, "y2": y2,
                 "crop": crop,
-                "feature": None,
                 "team_raw": None,
                 "cls_name": None,
                 "conf": None,
             })
 
-        # -----------------------------
-        # 2) CLASSIFICADOR — recolher classes brutas + confiança
-        # -----------------------------
-        if classifier is not None and USE_TEAM_CLASSIFIER:
+        # ============================================================
+        # 2) CLASSIFICADOR
+        # ============================================================
+        if classifier is not None:
             for p in players:
                 if p["role"] != "player":
                     continue
 
                 crop = p["crop"]
                 if crop is None:
-                    p["team_raw"] = None
                     continue
 
                 cls_name, conf = classifier.predict_with_confidence(crop)
                 p["cls_name"] = cls_name
                 p["conf"] = conf
 
-                print(f"[Classifier] Raw class: {cls_name} (conf={conf:.2f})")
+                # guardar crop para debug
+                save_debug_crop(crop, frame_index, p["track_id"], cls_name, conf)
 
                 if conf >= 0.60:
                     frame_classes_raw.append(cls_name)
 
-        elif USE_CLUSTERING:
-            features = []
-            for p in players:
-                if p["role"] != "player":
-                    continue
-                if p["crop"] is None:
-                    continue
-                p["feature"] = extract_jersey_feature(p["crop"])
-                features.append(p["feature"])
-
-            cluster_labels = cluster_players_kmeans(features)
-
-            idx = 0
-            for p in players:
-                if p["role"] != "player":
-                    continue
-                if p["feature"] is None:
-                    p["team_raw"] = None
-                    continue
-
-                cluster_id = cluster_labels[idx]
-                idx += 1
-                p["team_raw"] = "A" if cluster_id == 0 else "B"
-
-        else:
-            for p in players:
-                p["team_raw"] = None
-
-        # -----------------------------
-        # 3) Descobrir as duas equipas dominantes no frame
-        # -----------------------------
+        # ============================================================
+        # 3) Descobrir equipas dominantes no frame
+        # ============================================================
         frame_team_classes = []
-
         if frame_classes_raw:
             counts = Counter(frame_classes_raw)
             most_common = counts.most_common(2)
             frame_team_classes = [c[0] for c in most_common]
-            print(f"[FrameTeams] Dominant classes this frame: {frame_team_classes}")
-        else:
-            print("[FrameTeams] No confident classes this frame.")
 
+        # mapear classes → A/B
         for cls_name in frame_team_classes:
             if cls_name not in team_map:
                 if len(team_map) == 0:
                     team_map[cls_name] = "A"
-                    print(f"[TeamMap] Assigning {cls_name} → A (global)")
                 elif len(team_map) == 1:
                     team_map[cls_name] = "B"
-                    print(f"[TeamMap] Assigning {cls_name} → B (global)")
-                else:
-                    print(f"[TeamMap] Ignoring extra class {cls_name}, already have 2 teams.")
 
-        print(f"[TeamMap] Global mapping: {team_map}")
-
-        # -----------------------------
-        # 4) Atribuir A/B aos jogadores deste frame
-        # -----------------------------
+        # ============================================================
+        # 4) Atribuir A/B aos jogadores
+        # ============================================================
         for p in players:
             if p["role"] != "player":
                 continue
@@ -272,30 +214,20 @@ def process_video(model, classifier, local_video, original_name):
             conf = p["conf"]
 
             if cls_name is None or conf is None:
-                p["team_raw"] = None
                 continue
 
             if conf < 0.60:
-                print(f"[Classifier] Ignored low-confidence prediction {cls_name} (conf={conf:.2f})")
-                p["team_raw"] = None
                 continue
 
             if frame_team_classes and cls_name not in frame_team_classes:
-                print(f"[FrameTeams] Ignoring class {cls_name} (not in dominant {frame_team_classes})")
-                p["team_raw"] = None
                 continue
 
             if cls_name in team_map:
-                mapped_team = team_map[cls_name]
-                print(f"[TeamMap] {cls_name} mapped to {mapped_team}")
-                p["team_raw"] = mapped_team
-            else:
-                print(f"[TeamMap] Unknown class {cls_name}, no global mapping. Ignored.")
-                p["team_raw"] = None
+                p["team_raw"] = team_map[cls_name]
 
-        # -----------------------------
-        # 5) MEMÓRIA TEMPORAL (cluster_memory por track_id)
-        # -----------------------------
+        # ============================================================
+        # 5) Memória temporal (cluster_memory)
+        # ============================================================
         for p in players:
             if p["role"] != "player":
                 continue
@@ -304,18 +236,15 @@ def process_video(model, classifier, local_video, original_name):
             team_raw = p["team_raw"]
 
             if track_id is not None and team_raw is not None:
-                if track_id not in cluster_memory:
-                    cluster_memory[track_id] = []
-                cluster_memory[track_id].append(team_raw)
+                cluster_memory.setdefault(track_id, []).append(team_raw)
                 if len(cluster_memory[track_id]) > 10:
                     cluster_memory[track_id].pop(0)
 
-        # -----------------------------
-        # 6) EMA + FALLBACK + DECISÃO FINAL
-        # -----------------------------
+        # ============================================================
+        # 6) EMA + fallback + decisão final
+        # ============================================================
         frame_player_teams = []
 
-        # jogadores primeiro
         for p in players:
             role = p["role"]
             track_id = p["track_id"]
@@ -323,14 +252,8 @@ def process_video(model, classifier, local_video, original_name):
             team_raw = p["team_raw"]
 
             if role == "player":
-                if track_id is not None:
-                    history = cluster_memory.get(track_id, [])
-                    if history:
-                        team_temporal = max(set(history), key=history.count)
-                    else:
-                        team_temporal = team_raw
-                else:
-                    team_temporal = team_raw
+                history = cluster_memory.get(track_id, [])
+                team_temporal = max(set(history), key=history.count) if history else team_raw
 
                 if track_id is not None:
                     update_ema(team_memory, track_id, team_temporal)
@@ -345,25 +268,19 @@ def process_video(model, classifier, local_video, original_name):
                 label_str = draw_entity(frame, role, team, x1, y1, x2, y2)
                 labels_file.write(f"{frame_name} {label_str}\n")
 
-        # equipa dominante no frame (para guarda-redes)
+        # equipa dominante → guarda-redes
         majority_team = None
         if frame_player_teams:
             countA = frame_player_teams.count("A")
             countB = frame_player_teams.count("B")
-            if countA > countB:
-                majority_team = "A"
-            elif countB > countA:
-                majority_team = "B"
+            majority_team = "A" if countA > countB else "B"
 
-        # guarda-redes depois
         for p in players:
             if p["role"] != "goalkeeper":
                 continue
 
             x1, y1, x2, y2 = p["x1"], p["y1"], p["x2"], p["y2"]
-            team = majority_team  # guarda-redes da equipa dominante no frame
-
-            label_str = draw_entity(frame, "goalkeeper", team, x1, y1, x2, y2)
+            label_str = draw_entity(frame, "goalkeeper", majority_team, x1, y1, x2, y2)
             labels_file.write(f"{frame_name} {label_str}\n")
 
         cv2.imwrite(frame_path, frame)
@@ -377,21 +294,15 @@ def process_video(model, classifier, local_video, original_name):
     return output_video, frames_dir, labels_path
 
 
-# -----------------------------
+# ============================================================
 # MAIN
-# -----------------------------
+# ============================================================
 def main():
-    print("==============================")
-    print("   PROCESS VIDEO PIPELINE — classifier + temporal + robust teams")
-    print("==============================\n")
-    print(">>> USING process_video — classificador de equipamentos <<<")
 
     model = load_yolo_model()
 
-    classifier = None
-    if USE_TEAM_CLASSIFIER:
-        classifier_path = load_team_classifier()
-        classifier = TeamClassifier(classifier_path)
+    classifier_path = load_team_classifier()
+    classifier = TeamClassifier(classifier_path)
 
     files_all, files_videos = list_incoming()
     if not files_videos:
@@ -412,39 +323,30 @@ def main():
         start_time = int(data.get("start", 0))
         duration = int(data.get("duration", 0))
 
-        if duration > 0:
-            cut_path = cut_video(local_video, start_time, duration)
-        else:
-            cut_path = local_video
-
+        cut_path = cut_video(local_video, start_time, duration) if duration > 0 else local_video
         safe_video = convert_video_to_safe_format(cut_path)
 
         output_video, frames_dir, labels_path = process_video(
             model, classifier, safe_video, os.path.basename(key)
         )
 
-        annotated_remote = f"processed/{os.path.basename(output_video)}"
-        upload_file(output_video, annotated_remote)
-
-        original_remote = f"processed/originals/{os.path.basename(key)}"
-        upload_file(local_video, original_remote)
+        upload_file(output_video, f"processed/{os.path.basename(output_video)}")
+        upload_file(local_video, f"processed/originals/{os.path.basename(key)}")
 
         for root, dirs, files_local in os.walk(frames_dir):
             for f in files_local:
-                local_path = os.path.join(root, f)
-                remote_path = f"processed/frames/{os.path.basename(frames_dir)}/{f}"
-                upload_file(local_path, remote_path)
+                upload_file(os.path.join(root, f),
+                            f"processed/frames/{os.path.basename(frames_dir)}/{f}")
 
         upload_file(labels_path, f"processed/labels/{os.path.basename(labels_path)}")
 
         video_url = (
             f"https://f003.backblazeb2.com/file/"
             f"{os.getenv('VIDEOS_BUCKET', 'handball-videos')}/"
-            f"{annotated_remote}"
+            f"processed/{os.path.basename(output_video)}"
         )
 
         wordpress_endpoint = "https://mariocesar.navarro.pt/wp/wp-json/7motion/v1/create-video-page"
-
         payload = {
             "video_url": video_url,
             "user_email": user_email,
@@ -454,8 +356,7 @@ def main():
 
         try:
             resp = requests.post(wordpress_endpoint, json=payload, timeout=20)
-            data_wp = resp.json()
-            page_url = data_wp.get("page_url", video_url)
+            page_url = resp.json().get("page_url", video_url)
         except Exception:
             page_url = video_url
 
