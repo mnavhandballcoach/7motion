@@ -3,20 +3,20 @@
 import cv2
 import numpy as np
 
-MIN_CROP_SIZE = 150  # tamanho mínimo real para ver camisola inteira
-PAD_RATIO = 0.60     # expandir 60% do maior lado
+MIN_CROP_SIZE = 180      # garantir camisola inteira
+PAD_RATIO = 0.80         # expandir 80% do maior lado
 
 def crop_with_pad(frame, x1, y1, x2, y2, w, h):
     """
-    Crop quadrado, grande, centrado no jogador.
-    Nunca reduz o bounding box original — só expande.
+    Crop quadrado, gigante, centrado no jogador.
+    Ideal para padrões complexos (riscas, listas).
     """
 
     w_box = x2 - x1
     h_box = y2 - y1
     box_size = max(w_box, h_box)
 
-    # pad grande
+    # pad enorme
     pad = int(box_size * PAD_RATIO)
 
     # centro do jogador
@@ -38,7 +38,7 @@ def crop_with_pad(frame, x1, y1, x2, y2, w, h):
 
     ch, cw = crop.shape[:2]
 
-    # garantir tamanho mínimo
+    # garantir tamanho mínimo real
     if ch < MIN_CROP_SIZE or cw < MIN_CROP_SIZE:
         return None, (x1p, y1p, x2p, y2p)
 
@@ -48,6 +48,5 @@ def crop_with_pad(frame, x1, y1, x2, y2, w, h):
 def is_box_too_small(w_box, h_box):
     """
     Filtra bounding boxes demasiado pequenas.
-    Agora muito mais exigente.
     """
-    return w_box < 50 or h_box < 80
+    return w_box < 60 or h_box < 90
