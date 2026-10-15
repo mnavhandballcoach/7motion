@@ -1,8 +1,8 @@
 # ============================
 # Toggles
 # ============================
-USE_TEAM_CLASSIFIER = True       # ativa o classificador de equipas
-USE_CLUSTERING = False           # ativa clusterização por cores (KMeans)
+USE_TEAM_CLASSIFIER = True
+USE_CLUSTERING = False
 
 import sys
 import os
@@ -90,7 +90,6 @@ def process_video(model, classifier, local_video, original_name):
     last_team = {}
     fallback_counter = {}
 
-    # memória temporal por track_id
     cluster_memory = {}  # track_id -> lista de "A"/"B"
 
     CLASSIFY_CLASSES = ("player", "goalkeeper")
@@ -125,13 +124,11 @@ def process_video(model, classifier, local_video, original_name):
 
             track_id = int(box.id[0]) if box.id is not None else None
 
-            # árbitro
             if base_label == "referee":
                 label_str = draw_entity(frame, "referee", None, x1, y1, x2, y2)
                 labels_file.write(f"{frame_name} {label_str}\n")
                 continue
 
-            # bola
             if base_label == "ball":
                 label_str = draw_entity(frame, "ball", None, x1, y1, x2, y2)
                 labels_file.write(f"{frame_name} {label_str}\n")
@@ -179,15 +176,21 @@ def process_video(model, classifier, local_video, original_name):
                     continue
 
                 cls_name = classifier.predict(crop)
+                print(f"[Classifier] Raw class: {cls_name}")
 
                 # Se for uma classe nova, atribui A ou B
                 if cls_name not in team_map:
                     if len(team_map) == 0:
                         team_map[cls_name] = "A"
+                        print(f"[TeamMap] Assigning {cls_name} → A")
                     else:
                         team_map[cls_name] = "B"
+                        print(f"[TeamMap] Assigning {cls_name} → B")
 
-                p["team_raw"] = team_map[cls_name]
+                mapped_team = team_map[cls_name]
+                print(f"[TeamMap] {cls_name} mapped to {mapped_team}")
+
+                p["team_raw"] = mapped_team
 
         elif USE_CLUSTERING:
             # fallback: clusterização por cor
@@ -210,7 +213,6 @@ def process_video(model, classifier, local_video, original_name):
                 p["team_raw"] = "A" if cluster_id == 0 else "B"
 
         else:
-            # sem classificador e sem clusterização: nada
             for p in players:
                 p["team_raw"] = None
 
@@ -237,7 +239,6 @@ def process_video(model, classifier, local_video, original_name):
             x1, y1, x2, y2 = p["x1"], p["y1"], p["x2"], p["y2"]
             team_raw = p["team_raw"]
 
-            # decisão temporal por maioria dos últimos 10 frames
             if track_id is not None:
                 history = cluster_memory.get(track_id, [])
                 if history:
@@ -247,7 +248,6 @@ def process_video(model, classifier, local_video, original_name):
             else:
                 team_temporal = team_raw
 
-            # EMA + fallback
             if track_id is not None:
                 update_ema(team_memory, track_id, team_temporal)
                 team = decide_team(team_memory, track_id)
