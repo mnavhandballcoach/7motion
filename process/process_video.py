@@ -95,6 +95,9 @@ def process_video(model, classifier, local_video, original_name):
 
     CLASSIFY_CLASSES = ("player", "goalkeeper")
 
+    # Mapeamento dinâmico das classes do classificador → A/B
+    team_map = {}
+
     while True:
         ret, frame = cap.read()
         if not ret:
@@ -168,13 +171,23 @@ def process_video(model, classifier, local_video, original_name):
         # 2) CLASSIFICADOR OU CLUSTERIZAÇÃO
         # -----------------------------
         if classifier is not None and USE_TEAM_CLASSIFIER:
-            # usar o modelo de equipamentos
+
             for p in players:
-                if p["crop"] is None:
+                crop = p["crop"]
+                if crop is None:
                     p["team_raw"] = None
                     continue
-                pred = classifier.predict(p["crop"])
-                p["team_raw"] = pred
+
+                cls_name = classifier.predict(crop)
+
+                # Se for uma classe nova, atribui A ou B
+                if cls_name not in team_map:
+                    if len(team_map) == 0:
+                        team_map[cls_name] = "A"
+                    else:
+                        team_map[cls_name] = "B"
+
+                p["team_raw"] = team_map[cls_name]
 
         elif USE_CLUSTERING:
             # fallback: clusterização por cor
@@ -269,7 +282,6 @@ def main():
 
     classifier = None
     if USE_TEAM_CLASSIFIER:
-        # load_team_classifier devolve APENAS o caminho
         classifier_path = load_team_classifier()
         classifier = TeamClassifier(classifier_path)
 
