@@ -29,7 +29,7 @@ from process.io.ffmpeg import cut_video, convert_video_to_safe_format
 from process.io.emailer import send_email
 
 print("\n==============================")
-print("   PROCESS VIDEO PIPELINE — classifier + temporal + 2 teams/frame")
+print("   PROCESS VIDEO PIPELINE — classifier + temporal + robust teams")
 print("==============================\n")
 
 
@@ -93,7 +93,8 @@ def process_video(model, classifier, local_video, original_name):
 
     cluster_memory = {}  # track_id -> lista de "A"/"B"
 
-    CLASSIFY_CLASSES = ("player", "goalkeeper")
+    # só jogadores entram no classificador de equipas
+    CLASSIFY_CLASSES = ("player",)
 
     # Mapeamento global das classes do classificador → A/B (não muda ao longo do jogo)
     team_map = {}
@@ -135,15 +136,29 @@ def process_video(model, classifier, local_video, original_name):
                 labels_file.write(f"{frame_name} {label_str}\n")
                 continue
 
-            if base_label not in CLASSIFY_CLASSES:
+            role = base_label
+
+            # guarda-redes não entram no classificador de equipas
+            if base_label == "goalkeeper":
+                crop, _ = crop_with_pad(frame, x1, y1, x2, y2, w, h)
+                players.append({
+                    "role": "goalkeeper",
+                    "track_id": track_id,
+                    "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+                    "crop": crop,
+                    "feature": None,
+                    "team_raw": None,
+                    "cls_name": None,
+                    "conf": None,
+                })
                 continue
 
-            role = base_label
+            if base_label not in CLASSIFY_CLASSES:
+                continue
 
             if track_id is not None:
                 init_track_memory(team_memory, fallback_counter, last_team, track_id)
 
-            # se a box for demasiado pequena, nem tentamos classificar
             if is_box_too_small(w_box, h_box):
                 players.append({
                     "role": role,
@@ -175,6 +190,9 @@ def process_video(model, classifier, local_video, original_name):
         # -----------------------------
         if classifier is not None and USE_TEAM_CLASSIFIER:
             for p in players:
+                if p["role"] != "player":
+                    continue
+
                 crop = p["crop"]
                 if crop is None:
                     p["team_raw"] = None
@@ -186,14 +204,14 @@ def process_video(model, classifier, local_video, original_name):
 
                 print(f"[Classifier] Raw class: {cls_name} (conf={conf:.2f})")
 
-                # só consideramos para descobrir equipas do frame se confiança for razoável
                 if conf >= 0.60:
                     frame_classes_raw.append(cls_name)
 
         elif USE_CLUSTERING:
-            # fallback: clusterização por cor
             features = []
             for p in players:
+                if p["role"] != "player":
+                    continue
                 if p["crop"] is None:
                     continue
                 p["feature"] = extract_jersey_feature(p["crop"])
@@ -203,6 +221,8 @@ def process_video(model, classifier, local_video, original_name):
 
             idx = 0
             for p in players:
+                if p["role"] != "player":
+                    continue
                 if p["feature"] is None:
                     p["team_raw"] = None
                     continue
@@ -222,15 +242,12 @@ def process_video(model, classifier, local_video, original_name):
 
         if frame_classes_raw:
             counts = Counter(frame_classes_raw)
-            # ordena por frequência (mais comuns primeiro)
             most_common = counts.most_common(2)
             frame_team_classes = [c[0] for c in most_common]
-
             print(f"[FrameTeams] Dominant classes this frame: {frame_team_classes}")
         else:
             print("[FrameTeams] No confident classes this frame.")
 
-        # se ainda não temos mapeamento global, inicializamos com as classes dominantes
         for cls_name in frame_team_classes:
             if cls_name not in team_map:
                 if len(team_map) == 0:
@@ -240,7 +257,6 @@ def process_video(model, classifier, local_video, original_name):
                     team_map[cls_name] = "B"
                     print(f"[TeamMap] Assigning {cls_name} → B (global)")
                 else:
-                    # já temos 2 equipas globais, ignoramos novas classes
                     print(f"[TeamMap] Ignoring extra class {cls_name}, already have 2 teams.")
 
         print(f"[TeamMap] Global mapping: {team_map}")
@@ -249,6 +265,9 @@ def process_video(model, classifier, local_video, original_name):
         # 4) Atribuir A/B aos jogadores deste frame
         # -----------------------------
         for p in players:
+            if p["role"] != "player":
+                continue
+
             cls_name = p["cls_name"]
             conf = p["conf"]
 
@@ -256,25 +275,21 @@ def process_video(model, classifier, local_video, original_name):
                 p["team_raw"] = None
                 continue
 
-            # ignorar previsões fracas
             if conf < 0.60:
                 print(f"[Classifier] Ignored low-confidence prediction {cls_name} (conf={conf:.2f})")
                 p["team_raw"] = None
                 continue
 
-            # ignorar classes que não pertencem às equipas dominantes deste frame
             if frame_team_classes and cls_name not in frame_team_classes:
                 print(f"[FrameTeams] Ignoring class {cls_name} (not in dominant {frame_team_classes})")
                 p["team_raw"] = None
                 continue
 
-            # usar mapeamento global classes → A/B
             if cls_name in team_map:
                 mapped_team = team_map[cls_name]
                 print(f"[TeamMap] {cls_name} mapped to {mapped_team}")
                 p["team_raw"] = mapped_team
             else:
-                # classe desconhecida globalmente → ignorar
                 print(f"[TeamMap] Unknown class {cls_name}, no global mapping. Ignored.")
                 p["team_raw"] = None
 
@@ -282,6 +297,9 @@ def process_video(model, classifier, local_video, original_name):
         # 5) MEMÓRIA TEMPORAL (cluster_memory por track_id)
         # -----------------------------
         for p in players:
+            if p["role"] != "player":
+                continue
+
             track_id = p["track_id"]
             team_raw = p["team_raw"]
 
@@ -294,31 +312,58 @@ def process_video(model, classifier, local_video, original_name):
 
         # -----------------------------
         # 6) EMA + FALLBACK + DECISÃO FINAL
-        # (EMA ainda é o antigo — vamos melhorar no próximo passo)
         # -----------------------------
+        frame_player_teams = []
+
+        # jogadores primeiro
         for p in players:
             role = p["role"]
             track_id = p["track_id"]
             x1, y1, x2, y2 = p["x1"], p["y1"], p["x2"], p["y2"]
             team_raw = p["team_raw"]
 
-            if track_id is not None:
-                history = cluster_memory.get(track_id, [])
-                if history:
-                    team_temporal = max(set(history), key=history.count)
+            if role == "player":
+                if track_id is not None:
+                    history = cluster_memory.get(track_id, [])
+                    if history:
+                        team_temporal = max(set(history), key=history.count)
+                    else:
+                        team_temporal = team_raw
                 else:
                     team_temporal = team_raw
-            else:
-                team_temporal = team_raw
 
-            if track_id is not None:
-                update_ema(team_memory, track_id, team_temporal)
-                team = decide_team(team_memory, track_id)
-                team = apply_fallback(track_id, team, last_team, fallback_counter)
-            else:
-                team = team_temporal
+                if track_id is not None:
+                    update_ema(team_memory, track_id, team_temporal)
+                    team = decide_team(team_memory, track_id)
+                    team = apply_fallback(track_id, team, last_team, fallback_counter)
+                else:
+                    team = team_temporal
 
-            label_str = draw_entity(frame, role, team, x1, y1, x2, y2)
+                if team is not None:
+                    frame_player_teams.append(team)
+
+                label_str = draw_entity(frame, role, team, x1, y1, x2, y2)
+                labels_file.write(f"{frame_name} {label_str}\n")
+
+        # equipa dominante no frame (para guarda-redes)
+        majority_team = None
+        if frame_player_teams:
+            countA = frame_player_teams.count("A")
+            countB = frame_player_teams.count("B")
+            if countA > countB:
+                majority_team = "A"
+            elif countB > countA:
+                majority_team = "B"
+
+        # guarda-redes depois
+        for p in players:
+            if p["role"] != "goalkeeper":
+                continue
+
+            x1, y1, x2, y2 = p["x1"], p["y1"], p["x2"], p["y2"]
+            team = majority_team  # guarda-redes da equipa dominante no frame
+
+            label_str = draw_entity(frame, "goalkeeper", team, x1, y1, x2, y2)
             labels_file.write(f"{frame_name} {label_str}\n")
 
         cv2.imwrite(frame_path, frame)
@@ -337,7 +382,7 @@ def process_video(model, classifier, local_video, original_name):
 # -----------------------------
 def main():
     print("==============================")
-    print("   PROCESS VIDEO PIPELINE — classifier + temporal + 2 teams/frame")
+    print("   PROCESS VIDEO PIPELINE — classifier + temporal + robust teams")
     print("==============================\n")
     print(">>> USING process_video — classificador de equipamentos <<<")
 
