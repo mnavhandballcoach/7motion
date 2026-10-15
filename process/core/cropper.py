@@ -3,8 +3,8 @@
 import cv2
 import numpy as np
 
-MIN_CROP_SIZE = 180      # garantir camisola inteira
-PAD_RATIO = 0.80         # expandir 80% do maior lado
+MIN_CROP_SIZE = 200      # garantir camisola inteira
+PAD_RATIO = 1.0          # expandir 100% do maior lado
 
 def crop_with_pad(frame, x1, y1, x2, y2, w, h):
     """
