@@ -3,11 +3,10 @@ import cv2
 import json
 import shutil
 import numpy as np
-from collections import Counter
 import requests
 
 from process.core.models import load_yolo_model, load_team_classifier
-from process.core.cropper import crop_with_pad, is_box_too_small
+from process.core.cropper import crop_torso_advanced, is_box_too_small
 from process.core.classifier import TeamClassifier
 from process.core.drawer import draw_entity
 
@@ -120,19 +119,10 @@ def process_video(model, classifier, local_video, original_name):
                 labels_file.write(f"{frame_name} {label_str}\n")
                 continue
 
-            # guarda-redes
+            # guarda-redes → NÃO VAI PARA O CLASSIFIER
             if base_label == "goalkeeper":
-                crop, _ = crop_with_pad(frame, x1, y1, x2, y2, w, h)
-                save_debug_crop(crop, frame_index, track_id, "goalkeeper", 1.0, base_name)
-
-                players.append({
-                    "role": "goalkeeper",
-                    "track_id": track_id,
-                    "x1": x1, "y1": y1, "x2": x2, "y2": y2,
-                    "crop": crop,
-                    "cls_name": None,
-                    "conf": None,
-                })
+                label_str = draw_entity(frame, "goalkeeper", None, x1, y1, x2, y2)
+                labels_file.write(f"{frame_name} {label_str}\n")
                 continue
 
             # só jogadores
@@ -150,7 +140,8 @@ def process_video(model, classifier, local_video, original_name):
                 })
                 continue
 
-            crop, _ = crop_with_pad(frame, x1, y1, x2, y2, w, h)
+            # TORSO CROPPER AVANÇADO
+            crop = crop_torso_advanced(frame, x1, y1, x2, y2, w, h)
             save_debug_crop(crop, frame_index, track_id, "raw", 0.0, base_name)
 
             players.append({
@@ -187,18 +178,8 @@ def process_video(model, classifier, local_video, original_name):
             role = p["role"]
             x1, y1, x2, y2 = p["x1"], p["y1"], p["x2"], p["y2"]
             cls_name = p["cls_name"]
-            conf = p["conf"]
 
             label_str = draw_entity(frame, role, cls_name, x1, y1, x2, y2)
-            labels_file.write(f"{frame_name} {label_str}\n")
-
-        # guarda-redes sem equipa
-        for p in players:
-            if p["role"] != "goalkeeper":
-                continue
-
-            x1, y1, x2, y2 = p["x1"], p["y1"], p["x2"], p["y2"]
-            label_str = draw_entity(frame, "goalkeeper", None, x1, y1, x2, y2)
             labels_file.write(f"{frame_name} {label_str}\n")
 
         cv2.imwrite(frame_path, frame)
