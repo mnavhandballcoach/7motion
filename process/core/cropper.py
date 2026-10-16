@@ -1,46 +1,68 @@
-# core/cropper.py
+# core/cropper.py Claude
 
 import cv2
 import numpy as np
 
-def crop_torso_advanced(frame, x1, y1, x2, y2, frame_w, frame_h):
-    """
-    Recorta o tronco do jogador de forma avançada:
-    - remove cabeça
-    - remove pernas
-    - centra o tronco
-    - replica o estilo do dataset
-    - protege contra YOLO boxes demasiado altos/largos
-    """
 
+def crop_player(frame, x1, y1, x2, y2, frame_w, frame_h):
+    """
+    Crop da BOX INTEIRA do jogador, igual ao que o YOLO usou no treino do
+    classifier. NÃO redimensiona nem deforma: o Ultralytics aplica o mesmo
+    pré-processamento do treino (resize do lado menor + center crop).
+
+    IMPORTANTE: passar sempre um frame LIMPO (sem retângulos/textos desenhados).
+    """
+    x1 = max(0, int(x1))
+    y1 = max(0, int(y1))
+    x2 = min(frame_w, int(x2))
+    y2 = min(frame_h, int(y2))
+
+    if x2 <= x1 or y2 <= y1:
+        return None
+
+    crop = frame[y1:y2, x1:x2]
+    if crop.size == 0:
+        return None
+
+    return crop.copy()
+
+
+def crop_torso_advanced(frame, x1, y1, x2, y2, frame_w, frame_h, out=224):
+    """
+    Recorta só o tronco (camisola), SEM deformar:
+    - vertical: de 15% a 55% da altura da box (cabeça fora, calções fora)
+    - horizontal: remove 15% de cada lado
+    - padding até ficar quadrado (não estica) e só depois redimensiona
+
+    Usar apenas se o classifier for treinado com este mesmo crop.
+    """
     w_box = x2 - x1
     h_box = y2 - y1
 
-    # centro vertical do jogador
-    center_y = y1 + h_box * 0.50
+    ty1 = int(y1 + h_box * 0.15)
+    ty2 = int(y1 + h_box * 0.55)
+    tx1 = int(x1 + w_box * 0.15)
+    tx2 = int(x2 - w_box * 0.15)
 
-    # proporções ideais do dataset (ajustadas para riscas)
-    torso_top = int(center_y - h_box * 0.35)   # sobe 35%
-    torso_bottom = int(center_y + h_box * 0.45) # desce 45%
+    ty1, ty2 = max(0, ty1), min(frame_h, ty2)
+    tx1, tx2 = max(0, tx1), min(frame_w, tx2)
 
-    # proteger contra limites da imagem
-    torso_top = max(0, torso_top)
-    torso_bottom = min(frame_h, torso_bottom)
-
-    # remover fundo lateral (10% de cada lado)
-    side_pad = int(w_box * 0.10)
-    torso_x1 = max(0, x1 + side_pad)
-    torso_x2 = min(frame_w, x2 - side_pad)
-
-    crop = frame[torso_top:torso_bottom, torso_x1:torso_x2]
-
-    if crop is None or crop.size == 0:
+    if ty2 <= ty1 or tx2 <= tx1:
         return None
 
-    # normalizar para 224x224 (igual ao dataset)
-    crop = cv2.resize(crop, (224, 224), interpolation=cv2.INTER_AREA)
+    crop = frame[ty1:ty2, tx1:tx2]
+    if crop.size == 0:
+        return None
 
-    return crop
+    # padding para quadrado (sem deformar)
+    ch, cw = crop.shape[:2]
+    s = max(ch, cw)
+    canvas = np.zeros((s, s, 3), dtype=crop.dtype)
+    oy = (s - ch) // 2
+    ox = (s - cw) // 2
+    canvas[oy:oy + ch, ox:ox + cw] = crop
+
+    return cv2.resize(canvas, (out, out), interpolation=cv2.INTER_AREA)
 
 
 def crop_with_pad(frame, x1, y1, x2, y2, w, h):
@@ -54,10 +76,7 @@ def crop_with_pad(frame, x1, y1, x2, y2, w, h):
     w_box = x2 - x1
     h_box = y2 - y1
 
-    # Subir o bounding box (para apanhar tronco + padrão)
     shift_up = int(h_box * 0.25)
-
-    # Cortar parte inferior (pernas + chão)
     cut_bottom = int(h_box * 0.15)
 
     y1p = max(0, y1 - shift_up)
