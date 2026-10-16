@@ -195,6 +195,142 @@ def analyse_video(model, classifier, local_video, base_name):
     cap.release()
     return frame_dets, votes, fps, w, h, original_frames
 # ============================================================
+# PROCESSAMENTO DO VÍDEO (2 PASSAGENS)
+# ============================================================
+def process_video(model, classifier, local_video, original_name):
+
+    base_name = os.path.splitext(original_name)[0]
+
+    stable_dir = "output"
+    os.makedirs(stable_dir, exist_ok=True)
+    output_video = os.path.join(stable_dir, f"{base_name}_annotated.mp4")
+
+    frames_dir = os.path.join("output_frames", base_name)
+    labels_dir = "output_labels"
+    labels_path = os.path.join(labels_dir, f"{base_name}.txt")
+
+    os.makedirs(frames_dir, exist_ok=True)
+    os.makedirs(labels_dir, exist_ok=True)
+
+    # ---------- PASSAGEM 1 ----------
+    frame_dets, votes, fps, w, h, original_frames = analyse_video(
+        model, classifier, local_video, base_name
+    )
+
+    # ---------- escolher as 2 equipas ----------
+    kits = []
+    kit_scores = None
+
+    if classifier is not None and votes is not None and votes.acc:
+        kits, kit_scores = choose_kits(votes, classifier.names)
+
+        top = np.argsort(-kit_scores)[:4]
+        resumo = ", ".join(
+            f"{classifier.names[int(i)]}={kit_scores[int(i)]:.1f}" for i in top
+        )
+        print(f"[teams] tracks com votos: {len(votes.acc)} | top classes: {resumo}")
+        if len(kits) > 0:
+            print(f"[teams] Team A = {classifier.names[kits[0]]}")
+        if len(kits) > 1:
+            print(f"[teams] Team B = {classifier.names[kits[1]]}")
+    else:
+        print("[teams] sem votos do classifier: tudo fica como Player")
+
+    # ---------- LOG COMPLETO ----------
+    log = {
+        "video_id": base_name,
+        "kits": [classifier.names[k] for k in kits] if kits else [],
+        "kit_scores": {},
+        "tracks": {}
+    }
+
+    if kit_scores is not None:
+        log["kit_scores"] = {
+            classifier.names[i]: float(kit_scores[i])
+            for i in range(len(kit_scores))
+        }
+
+    # ---------- PASSAGEM 2: desenhar ----------
+    cap = cv2.VideoCapture(local_video)
+    labels_file = open(labels_path, "w")
+
+    writer = cv2.VideoWriter(
+        output_video,
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        fps if fps > 0 else 30,
+        (w, h)
+    )
+
+    for frame_index, dets in enumerate(frame_dets):
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        frame_name = f"frame_{frame_index:05d}.jpg"
+        frame_path = os.path.join(frames_dir, frame_name)
+
+        # usar frame original (não anotado)
+        original_frame = original_frames[frame_index]
+
+        for e in dets:
+            x1, y1, x2, y2 = e["box"]
+            label = e["label"]
+            tid = e["track_id"]
+
+            # equipa final
+            team = None
+
+            if label == "player":
+                if kits:
+                    if tid is not None and votes is not None and tid in votes.acc:
+                        team = team_from_votes(votes.acc[tid], kits)
+                    elif e["frame_probs"] is not None:
+                        team = team_from_votes(e["frame_probs"], kits)
+
+                label_str = draw_entity(original_frame, "player", team, x1, y1, x2, y2)
+            else:
+                label_str = draw_entity(original_frame, label, None, x1, y1, x2, y2)
+
+            labels_file.write(f"{frame_name} {label_str}\n")
+
+            # LOG por track_id
+            if tid not in log["tracks"]:
+                log["tracks"][tid] = {
+                    "label": label,
+                    "frames": {},
+                    "final_team": None,
+                    "votes": votes.acc.get(tid).tolist() if tid in votes.acc else None,
+                    "obs": votes.obs.get(tid) if tid in votes.obs else 0
+                }
+
+            log["tracks"][tid]["frames"][frame_index] = {
+                "box": e["box"],
+                "team": team,
+                "probs": e["frame_probs"].tolist() if e["frame_probs"] is not None else None
+            }
+
+        # guardar frame original
+        cv2.imwrite(frame_path, original_frame)
+        writer.write(original_frame)
+
+    cap.release()
+    writer.release()
+    labels_file.close()
+
+    # equipa final por track_id
+    for tid, tdata in log["tracks"].items():
+        if tdata["votes"] is not None:
+            tdata["final_team"] = team_from_votes(np.array(tdata["votes"]), kits)
+
+    # guardar LOG
+    log_path = os.path.join("output", f"{base_name}_log.json")
+    with open(log_path, "w") as f:
+        json.dump(log, f, indent=2)
+
+    upload_file(log_path, f"processed/logs/{base_name}.json")
+
+    return output_video, frames_dir, labels_path
+# ============================================================
 # MAIN
 # ============================================================
 def main():
