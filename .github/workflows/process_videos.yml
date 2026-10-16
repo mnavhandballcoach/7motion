@@ -47,5 +47,10 @@ jobs:
         SMTP_PORT: ${{ secrets.SMTP_PORT }}
         SMTP_USER: ${{ secrets.SMTP_USER }}
         SMTP_PASS: ${{ secrets.SMTP_PASS }}
+
+        TEAM_MIN_SHARE: "0"
+        DEBUG_CROPS: "1"
+        DEBUG_CROPS_EVERY: "30"
+        
       run: |
         python process/process_video_claude.py
