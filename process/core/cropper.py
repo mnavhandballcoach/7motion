@@ -3,6 +3,23 @@
 import cv2
 import numpy as np
 
+def is_player_far(x1, y1, x2, y2, frame_w, frame_h):
+    w_box = x2 - x1
+    h_box = y2 - y1
+    area_box = w_box * h_box
+    area_frame = frame_w * frame_h
+
+    # critérios profissionais
+    too_short = h_box < frame_h * 0.12
+    too_narrow = w_box < frame_w * 0.05
+    too_small_area = area_box < area_frame * 0.02
+
+    return too_short or too_narrow or too_small_area
+
+
+def is_player_near(x1, y1, x2, y2, frame_w, frame_h):
+    return not is_player_far(x1, y1, x2, y2, frame_w, frame_h)
+
 
 def crop_player(frame, x1, y1, x2, y2, frame_w, frame_h):
     """
