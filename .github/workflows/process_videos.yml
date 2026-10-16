@@ -10,9 +10,45 @@ on:
 
   workflow_dispatch:
 
+# Uma corrida de cada vez: uma corrida nova espera que a atual acabe
+# (não a cancela). Evita dois processamentos ao mesmo tempo.
+concurrency:
+  group: 7motion-process-video
+  cancel-in-progress: false
+
 jobs:
-  process:
+  # Verificação leve (segundos): só instala o boto3 e olha para incoming/.
+  # Sem vídeos novos, o job "process" nem arranca (poupa minutos de runner).
+  check:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      has_videos: ${{ steps.check.outputs.has_videos }}
+
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: "3.10"
+
+    - name: Install boto3
+      run: pip install boto3
+
+    - name: Check incoming/
+      id: check
+      env:
+        AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      run: python process/io/check_incoming.py
+
+  process:
+    needs: check
+    if: needs.check.outputs.has_videos == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
 
     steps:
     - name: Checkout repo
@@ -57,10 +93,14 @@ jobs:
         SMTP_USER: ${{ secrets.SMTP_USER }}
         SMTP_PASS: ${{ secrets.SMTP_PASS }}
 
-        #TEAM_MIN_SHARE: "0"
-        TEAM_MIN_MASS: "0.10"
-        DEBUG_CROPS: "1"
+        TEAM_MODE: "color"
+
+        # Crops de debug: "1" para analisar, "0" em produção (poupa tempo e espaço)
+        DEBUG_CROPS: "0"
         DEBUG_CROPS_EVERY: "30"
-        
+
+        # Itens presos em processing/ há mais de X minutos vão para failed/
+        STALE_PROCESSING_MINUTES: "360"
+
       run: |
         python process/process_video_claude.py
