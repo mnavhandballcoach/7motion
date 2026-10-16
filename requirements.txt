@@ -17,4 +17,4 @@ ultralytics
 torch==2.5.1
 torchvision==0.20.1
 
-laps>=0.5.12
+lap=0.5.12
