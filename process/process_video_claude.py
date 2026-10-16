@@ -24,44 +24,57 @@ from process.io.emailer import send_email
 # ============================================================
 TRACKER = "bytetrack.yaml"
 
+# Como decidir as equipas:
+#   "color"      -> cor da camisola de cada jogador, agrupada em 2 equipas
+#                   com KMeans (não precisa do classifier; funciona com
+#                   equipas novas)
+#   "classifier" -> modelo treinado (votação por track + 2 kits mais votados)
+TEAM_MODE = os.getenv("TEAM_MODE", "color").strip().lower()
+
+# ---- modo "color" ----
+HUE_BINS = 12
+# Tons de pele e de chão de madeira (laranja/amarelo) são ignorados.
+# Pôr SKIN_HUE_LO=0 e SKIN_HUE_HI=0 desliga (se houver camisolas laranja).
+SKIN_HUE_LO = int(os.getenv("SKIN_HUE_LO", "4"))
+SKIN_HUE_HI = int(os.getenv("SKIN_HUE_HI", "24"))
+# Tracks com pelo menos isto de observações servem para formar as 2 equipas.
+COLOR_FIT_MIN_OBS = int(os.getenv("COLOR_FIT_MIN_OBS", "10"))
+# Tracks com menos observações que isto ficam como Player.
+COLOR_ASSIGN_MIN_OBS = int(os.getenv("COLOR_ASSIGN_MIN_OBS", "3"))
+# Se a distância à equipa errada não for pelo menos X vezes a distância à
+# certa, o jogador fica como Player (ambíguo).
+COLOR_MIN_MARGIN = float(os.getenv("COLOR_MIN_MARGIN", "1.15"))
+# Abaixo desta distância entre as 2 equipas o log avisa que as cores são
+# muito parecidas.
+COLOR_MIN_SEPARATION = float(os.getenv("COLOR_MIN_SEPARATION", "0.30"))
+
+# ---- modo "classifier" ----
 # Um jogador só recebe equipa se pelo menos esta fração dos seus votos
 # estiver nas 2 classes de kit escolhidas para o vídeo (0 a 1).
 MIN_TEAM_MASS = float(os.getenv("TEAM_MIN_MASS", "0.10"))
-
-# Para escolher as 2 equipas do vídeo, só contam tracks com pelo menos
-# este número de observações (evita tracks curtos e ruidosos).
 MIN_TRACK_OBS = int(os.getenv("TEAM_MIN_TRACK_OBS", "5"))
-
-# Classes de kit a ignorar na escolha das equipas (separadas por vírgula).
 EXCLUDE_CLASSES = {
     c.strip().lower()
     for c in os.getenv("TEAM_EXCLUDE_CLASSES", "").split(",")
     if c.strip()
 }
+CLASSIFY_EVERY = int(os.getenv("CLASSIFY_EVERY", "3"))
+WARMUP_OBS = int(os.getenv("CLASSIFY_WARMUP_OBS", "8"))
 
-# Tamanho mínimo da box para tentar classificar (antes: 25x40 no cropper).
-# Jogadores mais pequenos que isto nunca recebem votos.
+# ---- comum ----
+# Tamanho mínimo da box para tentar identificar a equipa.
 MIN_BOX_W = int(os.getenv("MIN_BOX_W", "16"))
 MIN_BOX_H = int(os.getenv("MIN_BOX_H", "32"))
 
-# Peso de cada voto = altura da box / (WEIGHT_REF * altura do frame),
-# limitado entre WEIGHT_MIN e 1. Evita que um jogador muito perto (e
-# possivelmente mal classificado) domine, e que os longes valham quase 0.
+# Peso de cada observação = altura da box / (WEIGHT_REF * altura do frame),
+# limitado entre WEIGHT_MIN e 1.
 WEIGHT_REF = float(os.getenv("VOTE_WEIGHT_REF", "0.20"))
 WEIGHT_MIN = float(os.getenv("VOTE_WEIGHT_MIN", "0.10"))
-
-# Velocidade: cada jogador é classificado em todos os frames nas primeiras
-# WARMUP observações e depois só 1 frame em cada CLASSIFY_EVERY.
-# Frames seguidos são quase iguais, por isso quase não muda o resultado.
-# CLASSIFY_EVERY=1 => classifica sempre (comportamento anterior).
-CLASSIFY_EVERY = int(os.getenv("CLASSIFY_EVERY", "3"))
-WARMUP_OBS = int(os.getenv("CLASSIFY_WARMUP_OBS", "8"))
 
 # Uploads em paralelo (resultado igual, só mais rápido).
 UPLOAD_WORKERS = int(os.getenv("UPLOAD_WORKERS", "8"))
 
 # Enviar para o Backblaze todos os frames anotados (processed/frames/...).
-# Pôr UPLOAD_FRAMES=0 se não precisares deles.
 UPLOAD_FRAMES = os.getenv("UPLOAD_FRAMES", "1") == "1"
 
 # Crops de debug: desligados por defeito. Ativar com DEBUG_CROPS=1.
@@ -126,18 +139,240 @@ def upload_many(pairs, run_log=None, what="ficheiros"):
 
 
 # ============================================================
-# VOTAÇÃO POR TRACK_ID
+# FUNÇÕES COMUNS
+# ============================================================
+def box_too_small(w_box, h_box):
+    return w_box < MIN_BOX_W or h_box < MIN_BOX_H
+
+
+def vote_weight(box_h, frame_h):
+    return float(min(1.0, max(WEIGHT_MIN, box_h / (WEIGHT_REF * float(frame_h)))))
+
+
+def save_debug_crop(crop, frame_index, track_id, cls_name=None, conf=None):
+    """Guarda o crop localmente; o envio é feito no fim, em paralelo."""
+    if crop is None:
+        return
+
+    debug_dir = os.path.join("debug_crops", f"frame_{frame_index:05d}")
+    os.makedirs(debug_dir, exist_ok=True)
+
+    if cls_name is not None and conf is not None:
+        fname = f"track_{track_id}_{cls_name}_{conf:.2f}.jpg"
+    else:
+        fname = f"track_{track_id}.jpg"
+
+    cv2.imwrite(os.path.join(debug_dir, fname), crop)
+
+
+# ============================================================
+# MODO "color": COR DA CAMISOLA
+# ============================================================
+def torso_color_feature(frame, x1, y1, x2, y2, fw, fh):
+    """
+    Descritor da cor da camisola: zona central do tronco da box.
+    Vetor = raiz de [histograma de tons (12 bins, só píxeis coloridos e sem
+    pele/chão), fração de branco, fração de escuro].
+    Devolve None se a zona for demasiado pequena.
+    """
+    w_box = x2 - x1
+    h_box = y2 - y1
+
+    tx1 = max(0, int(x1 + w_box * 0.25))
+    tx2 = min(fw, int(x2 - w_box * 0.25))
+    ty1 = max(0, int(y1 + h_box * 0.18))
+    ty2 = min(fh, int(y1 + h_box * 0.52))
+
+    if tx2 - tx1 < 4 or ty2 - ty1 < 4:
+        return None
+
+    roi = frame[ty1:ty2, tx1:tx2]
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    hch = hsv[..., 0]
+    sch = hsv[..., 1]
+    vch = hsv[..., 2]
+    n = float(hch.size)
+
+    dark = vch < 60
+    white = (sch < 40) & (vch >= 150)
+    colored = (sch >= 40) & (vch >= 60)
+
+    if SKIN_HUE_HI > SKIN_HUE_LO:
+        skin_or_floor = (hch >= SKIN_HUE_LO) & (hch <= SKIN_HUE_HI)
+        colored = colored & ~skin_or_floor
+
+    bins = (hch[colored].astype(np.int32) * HUE_BINS) // 180
+    hist = np.bincount(bins, minlength=HUE_BINS)[:HUE_BINS].astype(np.float64) / n
+
+    feat = np.concatenate([hist, [white.sum() / n, dark.sum() / n]])
+    return np.sqrt(feat).astype(np.float32)
+
+
+class TrackColors:
+    """Média ponderada do descritor de cor de cada track."""
+
+    def __init__(self):
+        self.acc = {}   # track_id -> soma(feat * peso)
+        self.w = {}     # track_id -> soma dos pesos
+        self.n = {}     # track_id -> nº de observações
+
+    def update(self, track_id, feat, weight):
+        if track_id not in self.acc:
+            self.acc[track_id] = np.zeros_like(feat, dtype=np.float64)
+            self.w[track_id] = 0.0
+            self.n[track_id] = 0
+        self.acc[track_id] += feat.astype(np.float64) * weight
+        self.w[track_id] += weight
+        self.n[track_id] += 1
+
+    def mean(self, track_id):
+        return (self.acc[track_id] / max(self.w[track_id], 1e-9)).astype(np.float32)
+
+
+def classify_color(feat, centroids):
+    """
+    Equipa mais próxima (distância euclidiana ao centro de cada equipa).
+    Devolve (equipa ou None se ambíguo, dist_A, dist_B, margem).
+    """
+    da = float(np.linalg.norm(feat - centroids["A"]))
+    db = float(np.linalg.norm(feat - centroids["B"]))
+
+    near, d_near, d_far = ("A", da, db) if da <= db else ("B", db, da)
+    ratio = d_far / max(d_near, 1e-6)
+
+    team = near if ratio >= COLOR_MIN_MARGIN else None
+    return team, da, db, ratio
+
+
+def build_color_teams(colors):
+    """
+    Forma as 2 equipas com KMeans sobre os tracks com observações suficientes
+    e atribui cada track à equipa mais próxima.
+    Devolve (centroids|None, team_of_track, details, info).
+    """
+    info = {}
+
+    fit = [t for t in colors.acc if colors.n[t] >= COLOR_FIT_MIN_OBS]
+    info["fit_tracks"] = len(fit)
+    if len(fit) < 2:
+        return None, {}, {}, info
+
+    feats = np.stack([colors.mean(t) for t in fit]).astype(np.float32)
+
+    cv2.setRNGSeed(0)   # resultado repetível
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 1e-3)
+    _, labels, centers = cv2.kmeans(
+        feats, 2, None, criteria, 10, cv2.KMEANS_PP_CENTERS
+    )
+    labels = labels.ravel()
+
+    sizes = [int((labels == k).sum()) for k in (0, 1)]
+    if min(sizes) == 0:
+        return None, {}, {}, info
+
+    if sizes[0] != sizes[1]:
+        a = 0 if sizes[0] > sizes[1] else 1
+    else:
+        obs = [
+            sum(colors.n[t] for t, lab in zip(fit, labels) if lab == k)
+            for k in (0, 1)
+        ]
+        a = 0 if obs[0] >= obs[1] else 1
+
+    centroids = {"A": centers[a].copy(), "B": centers[1 - a].copy()}
+    info["separation"] = float(np.linalg.norm(centers[0] - centers[1]))
+    info["sizes"] = {"A": sizes[a], "B": sizes[1 - a]}
+
+    team_of = {}
+    details = {}
+    for t in colors.acc:
+        if colors.n[t] < COLOR_ASSIGN_MIN_OBS:
+            team_of[t] = None
+            details[t] = None
+            continue
+        team, da, db, ratio = classify_color(colors.mean(t), centroids)
+        team_of[t] = team
+        details[t] = (da, db, ratio)
+
+    return centroids, team_of, details, info
+
+
+def describe_centroid(c):
+    """Texto legível de um centro de equipa: tom dominante, branco, escuro."""
+    frac = np.square(c.astype(np.float64))
+    hue_part = frac[:HUE_BINS]
+    best = int(hue_part.argmax())
+    hue_center = (best + 0.5) * 180.0 / HUE_BINS
+    return (
+        f"tom dominante H~{hue_center:.0f} ({hue_part[best]:.2f} da area) | "
+        f"branco={frac[HUE_BINS]:.2f} | escuro={frac[HUE_BINS + 1]:.2f}"
+    )
+
+
+def log_color_teams(run_log, info, centroids):
+    if centroids is None:
+        run_log.add(
+            f"[teams] cor: tracks suficientes para formar equipas = "
+            f"{info.get('fit_tracks', 0)} (preciso de 2+) -> tudo fica como Player"
+        )
+        return
+
+    sep = info["separation"]
+    run_log.add(
+        f"[teams] cor: tracks usados para formar equipas={info['fit_tracks']} | "
+        f"A={info['sizes']['A']} tracks, B={info['sizes']['B']} tracks | "
+        f"separacao={sep:.2f}"
+    )
+    if sep < COLOR_MIN_SEPARATION:
+        run_log.add(
+            f"[teams] AVISO: separacao abaixo de {COLOR_MIN_SEPARATION} "
+            f"(cores das equipas muito parecidas, resultado pode ser pouco fiavel)"
+        )
+    run_log.add(f"[teams] Team A: {describe_centroid(centroids['A'])}")
+    run_log.add(f"[teams] Team B: {describe_centroid(centroids['B'])}")
+
+
+def log_tracks_color(run_log, track_info, colors, team_of, details):
+    run_log.add("")
+    run_log.add("---- tracks de jogadores (por ordem de aparição) ----")
+
+    for tid, info in sorted(track_info.items(), key=lambda kv: kv[1]["first"]):
+        n = info["n"]
+        avg_h = info["sum_h"] / max(n, 1)
+        head = (
+            f"[track {tid}] frames {info['first']:05d}-{info['last']:05d} "
+            f"(n={n}) alt_media={avg_h:.0f}px pequena={100 * info['small'] / max(n, 1):.0f}%"
+        )
+
+        if tid not in colors.acc:
+            run_log.add(f"{head} | sem cor medida -> Player")
+            continue
+
+        obs = colors.n[tid]
+        det = details.get(tid)
+        if det is None:
+            run_log.add(f"{head} obs_cor={obs} -> Player (poucas observacoes)")
+            continue
+
+        da, db, ratio = det
+        team = team_of.get(tid)
+        result = f"Team {team}" if team else "Player (ambiguo)"
+        run_log.add(
+            f"{head} obs_cor={obs} distA={da:.2f} distB={db:.2f} "
+            f"margem={ratio:.1f}x -> {result}"
+        )
+
+
+# ============================================================
+# MODO "classifier": VOTAÇÃO POR TRACK_ID
 # ============================================================
 class TrackVotes:
-    """
-    Soma as probabilidades do classifier ao longo do tempo para cada
-    track_id. Crops maiores (jogador mais perto da câmara) pesam mais.
-    """
+    """Soma as probabilidades do classifier ao longo do tempo por track_id."""
 
     def __init__(self, n_classes):
         self.n_classes = n_classes
-        self.acc = {}   # track_id -> vetor de votos acumulados
-        self.obs = {}   # track_id -> nº de observações classificadas
+        self.acc = {}
+        self.obs = {}
 
     def update(self, track_id, probs, weight):
         if track_id not in self.acc:
@@ -145,14 +380,6 @@ class TrackVotes:
             self.obs[track_id] = 0
         self.acc[track_id] += probs * weight
         self.obs[track_id] += 1
-
-
-def box_too_small(w_box, h_box):
-    return w_box < MIN_BOX_W or h_box < MIN_BOX_H
-
-
-def vote_weight(box_h, frame_h):
-    return float(min(1.0, max(WEIGHT_MIN, box_h / (WEIGHT_REF * float(frame_h)))))
 
 
 def should_classify(votes, track_id, frame_index):
@@ -164,11 +391,6 @@ def should_classify(votes, track_id, frame_index):
 
 
 def choose_kits(votes, names):
-    """
-    Escolhe as 2 classes de kit mais presentes no vídeo.
-    Cada jogador (track) conta uma vez, repartido pelas suas classes.
-    Devolve ([idx_A, idx_B], scores_por_classe).
-    """
     n = votes.n_classes
     excluded = [i for i in range(n) if str(names[i]).lower() in EXCLUDE_CLASSES]
 
@@ -194,10 +416,6 @@ def choose_kits(votes, names):
 
 
 def team_from_votes(vec, kits):
-    """
-    Decide "A" ou "B" olhando só para as 2 classes de kit escolhidas.
-    Devolve None se quase nada dos votos cair nessas 2 classes.
-    """
     if vec is None or len(kits) == 0:
         return None
 
@@ -214,26 +432,43 @@ def team_from_votes(vec, kits):
     return "A" if score_a >= score_b else "B"
 
 
+def log_tracks_classifier(run_log, track_info, votes, kits, classifier):
+    run_log.add("")
+    run_log.add("---- tracks de jogadores (por ordem de aparição) ----")
+
+    two = len(kits) == 2
+
+    for tid, info in sorted(track_info.items(), key=lambda kv: kv[1]["first"]):
+        n = info["n"]
+        avg_h = info["sum_h"] / max(n, 1)
+        head = (
+            f"[track {tid}] frames {info['first']:05d}-{info['last']:05d} "
+            f"(n={n}) alt_media={avg_h:.0f}px pequena={100 * info['small'] / max(n, 1):.0f}%"
+        )
+
+        vec = votes.acc.get(tid) if votes is not None else None
+        if vec is None:
+            run_log.add(f"{head} | sem crops/votos -> Player")
+            continue
+
+        total = float(vec.sum())
+        obs = votes.obs.get(tid, 0)
+        top = classifier.names[int(vec.argmax())]
+
+        if two and total > 0:
+            a = vec[kits[0]] / total
+            b = vec[kits[1]] / total
+            team = team_from_votes(vec, kits)
+            result = f"Team {team}" if team else "Player (votos fora de A/B)"
+            run_log.add(
+                f"{head} obs={obs} A={a:.2f} B={b:.2f} top={top} -> {result}"
+            )
+        else:
+            run_log.add(f"{head} obs={obs} top={top}")
+
+
 # ============================================================
-# GUARDAR CROP DE DEBUG (o envio é feito no fim, em paralelo)
-# ============================================================
-def save_debug_crop(crop, frame_index, track_id, cls_name=None, conf=None):
-    if crop is None:
-        return
-
-    debug_dir = os.path.join("debug_crops", f"frame_{frame_index:05d}")
-    os.makedirs(debug_dir, exist_ok=True)
-
-    if cls_name is not None and conf is not None:
-        fname = f"track_{track_id}_{cls_name}_{conf:.2f}.jpg"
-    else:
-        fname = f"track_{track_id}.jpg"
-
-    cv2.imwrite(os.path.join(debug_dir, fname), crop)
-
-
-# ============================================================
-# PASSAGEM 1: DETEÇÃO + TRACKING + VOTAÇÃO (sem desenhar)
+# PASSAGEM 1: DETEÇÃO + TRACKING + MEDIÇÃO (sem desenhar)
 # ============================================================
 def analyse_video(model, classifier, local_video):
     cap = cv2.VideoCapture(local_video)
@@ -241,11 +476,16 @@ def analyse_video(model, classifier, local_video):
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-    votes = TrackVotes(classifier.n_classes) if classifier is not None else None
+    use_color = TEAM_MODE == "color"
+    use_classifier = (TEAM_MODE == "classifier") and classifier is not None
+
+    votes = TrackVotes(classifier.n_classes) if use_classifier else None
+    colors = TrackColors()
+
     frame_dets = []      # uma lista de deteções por frame
     track_info = {}      # track_id -> dados de todos os frames de jogador
     stats = {
-        "detect_s": 0.0, "crop_s": 0.0, "classify_s": 0.0,
+        "detect_s": 0.0, "color_s": 0.0, "crop_s": 0.0, "classify_s": 0.0,
         "crops": 0, "players": 0, "players_no_id": 0, "players_small": 0,
     }
     frame_index = 0
@@ -288,6 +528,7 @@ def analyse_video(model, classifier, local_video):
                 "box_h": h_box,
                 "crop": None,
                 "frame_probs": None,
+                "color": None,
             }
             dets.append(entry)
 
@@ -302,7 +543,8 @@ def analyse_video(model, classifier, local_video):
             else:
                 info = track_info.setdefault(
                     track_id,
-                    {"first": frame_index, "last": frame_index, "n": 0, "sum_h": 0.0, "small": 0},
+                    {"first": frame_index, "last": frame_index,
+                     "n": 0, "sum_h": 0.0, "small": 0},
                 )
                 info["last"] = frame_index
                 info["n"] += 1
@@ -314,15 +556,30 @@ def analyse_video(model, classifier, local_video):
                     track_info[track_id]["small"] += 1
                 continue
 
-            # só faz o crop se este jogador vai ser classificado neste frame
-            if classifier is not None and should_classify(votes, track_id, frame_index):
+            if use_color:
                 t1 = time.perf_counter()
-                # box inteira, igual ao treino do classifier
+                feat = torso_color_feature(frame, x1, y1, x2, y2, w, h)
+                stats["color_s"] += time.perf_counter() - t1
+
+                if feat is not None:
+                    if track_id is not None:
+                        colors.update(track_id, feat, vote_weight(h_box, h))
+                    else:
+                        entry["color"] = feat
+
+                if DEBUG_CROPS and frame_index % DEBUG_EVERY == 0:
+                    save_debug_crop(
+                        crop_player(frame, x1, y1, x2, y2, w, h),
+                        frame_index, track_id,
+                    )
+
+            elif use_classifier and should_classify(votes, track_id, frame_index):
+                t1 = time.perf_counter()
                 entry["crop"] = crop_player(frame, x1, y1, x2, y2, w, h)
                 stats["crop_s"] += time.perf_counter() - t1
 
-        # classificação em lote + acumulação de votos por track_id
-        if classifier is not None:
+        # modo classifier: classificação em lote + votos por track_id
+        if use_classifier:
             batch = [p for p in players if p["crop"] is not None]
             if batch:
                 t2 = time.perf_counter()
@@ -332,8 +589,7 @@ def analyse_video(model, classifier, local_video):
 
                 for p, pr in zip(batch, probs):
                     if p["track_id"] is not None:
-                        weight = vote_weight(p["box_h"], h)
-                        votes.update(p["track_id"], pr, weight)
+                        votes.update(p["track_id"], pr, vote_weight(p["box_h"], h))
                     else:
                         p["frame_probs"] = pr
 
@@ -352,45 +608,7 @@ def analyse_video(model, classifier, local_video):
         frame_index += 1
 
     cap.release()
-    return frame_dets, votes, track_info, stats, fps, w, h
-
-
-# ============================================================
-# LOG POR JOGADOR (track)
-# ============================================================
-def log_tracks(run_log, track_info, votes, kits, classifier):
-    run_log.add("")
-    run_log.add("---- tracks de jogadores (por ordem de aparição) ----")
-
-    two = len(kits) == 2
-
-    for tid, info in sorted(track_info.items(), key=lambda kv: kv[1]["first"]):
-        n = info["n"]
-        avg_h = info["sum_h"] / max(n, 1)
-        head = (
-            f"[track {tid}] frames {info['first']:05d}-{info['last']:05d} "
-            f"(n={n}) alt_media={avg_h:.0f}px pequena={100 * info['small'] / max(n, 1):.0f}%"
-        )
-
-        vec = votes.acc.get(tid) if votes is not None else None
-        if vec is None:
-            run_log.add(f"{head} | sem crops/votos -> Player")
-            continue
-
-        total = float(vec.sum())
-        obs = votes.obs.get(tid, 0)
-        top = classifier.names[int(vec.argmax())]
-
-        if two and total > 0:
-            a = vec[kits[0]] / total
-            b = vec[kits[1]] / total
-            team = team_from_votes(vec, kits)
-            result = f"Team {team}" if team else "Player (votos fora de A/B)"
-            run_log.add(
-                f"{head} obs={obs} A={a:.2f} B={b:.2f} top={top} -> {result}"
-            )
-        else:
-            run_log.add(f"{head} obs={obs} top={top}")
+    return frame_dets, votes, colors, track_info, stats, fps, w, h
 
 
 # ============================================================
@@ -413,16 +631,17 @@ def process_video(model, classifier, local_video, original_name, run_log):
 
     run_log.add(f"=== LOG {base_name} | {time.strftime('%Y-%m-%d %H:%M:%S')} ===")
     run_log.add(
-        f"[config] CLASSIFY_EVERY={CLASSIFY_EVERY} WARMUP_OBS={WARMUP_OBS} "
-        f"TEAM_MIN_MASS={MIN_TEAM_MASS} TEAM_MIN_TRACK_OBS={MIN_TRACK_OBS} "
-        f"EXCLUDE={sorted(EXCLUDE_CLASSES) or '-'} UPLOAD_WORKERS={UPLOAD_WORKERS} "
-        f"UPLOAD_FRAMES={int(UPLOAD_FRAMES)} DEBUG_CROPS={int(DEBUG_CROPS)} "
-        f"MIN_BOX={MIN_BOX_W}x{MIN_BOX_H} WEIGHT_REF={WEIGHT_REF} WEIGHT_MIN={WEIGHT_MIN}"
+        f"[config] TEAM_MODE={TEAM_MODE} MIN_BOX={MIN_BOX_W}x{MIN_BOX_H} "
+        f"WEIGHT_REF={WEIGHT_REF} WEIGHT_MIN={WEIGHT_MIN} "
+        f"SKIN_HUE={SKIN_HUE_LO}-{SKIN_HUE_HI} COLOR_FIT_MIN_OBS={COLOR_FIT_MIN_OBS} "
+        f"COLOR_ASSIGN_MIN_OBS={COLOR_ASSIGN_MIN_OBS} COLOR_MIN_MARGIN={COLOR_MIN_MARGIN} "
+        f"UPLOAD_WORKERS={UPLOAD_WORKERS} UPLOAD_FRAMES={int(UPLOAD_FRAMES)} "
+        f"DEBUG_CROPS={int(DEBUG_CROPS)}"
     )
 
     # ---------- passagem 1 ----------
     t_p1 = time.perf_counter()
-    frame_dets, votes, track_info, stats, fps, w, h = analyse_video(
+    frame_dets, votes, colors, track_info, stats, fps, w, h = analyse_video(
         model, classifier, local_video
     )
     p1_s = time.perf_counter() - t_p1
@@ -433,33 +652,42 @@ def process_video(model, classifier, local_video, original_name, run_log):
         f"[time] passagem 1 total: {p1_s:.1f}s "
         f"({1000 * p1_s / max(n_frames, 1):.0f} ms/frame) | "
         f"deteção+tracking: {stats['detect_s']:.1f}s | "
-        f"crops: {stats['crop_s']:.1f}s | "
+        f"cor: {stats['color_s']:.1f}s | crops: {stats['crop_s']:.1f}s | "
         f"classifier: {stats['classify_s']:.1f}s ({stats['crops']} crops)"
     )
     run_log.add(
         f"[players] deteções={stats['players']} | sem ID={stats['players_no_id']} | "
-        f"pequenas demais (sem crop)={stats['players_small']} | "
+        f"pequenas demais={stats['players_small']} | "
         f"tracks distintos={len(track_info)}"
     )
 
-    # ---------- escolher as 2 equipas do vídeo ----------
+    # ---------- decidir as equipas ----------
+    centroids = None
+    team_of = {}
     kits = []
-    if classifier is not None and votes is not None and votes.acc:
-        kits, kit_scores = choose_kits(votes, classifier.names)
 
-        top = np.argsort(-kit_scores)[:5]
-        resumo = ", ".join(
-            f"{classifier.names[int(i)]}={kit_scores[int(i)]:.1f}" for i in top
-        )
-        run_log.add(f"[teams] tracks com votos: {len(votes.acc)} | top classes: {resumo}")
-        if len(kits) > 0:
-            run_log.add(f"[teams] Team A = {classifier.names[kits[0]]}")
-        if len(kits) > 1:
-            run_log.add(f"[teams] Team B = {classifier.names[kits[1]]}")
+    if TEAM_MODE == "color":
+        centroids, team_of, details, info = build_color_teams(colors)
+        log_color_teams(run_log, info, centroids)
+        log_tracks_color(run_log, track_info, colors, team_of, details)
+
     else:
-        run_log.add("[teams] sem votos do classifier: tudo fica como Player")
+        if classifier is not None and votes is not None and votes.acc:
+            kits, kit_scores = choose_kits(votes, classifier.names)
 
-    log_tracks(run_log, track_info, votes, kits, classifier)
+            top = np.argsort(-kit_scores)[:5]
+            resumo = ", ".join(
+                f"{classifier.names[int(i)]}={kit_scores[int(i)]:.1f}" for i in top
+            )
+            run_log.add(f"[teams] tracks com votos: {len(votes.acc)} | top classes: {resumo}")
+            if len(kits) > 0:
+                run_log.add(f"[teams] Team A = {classifier.names[kits[0]]}")
+            if len(kits) > 1:
+                run_log.add(f"[teams] Team B = {classifier.names[kits[1]]}")
+        else:
+            run_log.add("[teams] sem votos do classifier: tudo fica como Player")
+
+        log_tracks_classifier(run_log, track_info, votes, kits, classifier)
 
     # ---------- passagem 2: desenhar ----------
     t_p2 = time.perf_counter()
@@ -492,11 +720,17 @@ def process_video(model, classifier, local_video, original_name, run_log):
                 team = None
                 tid = e["track_id"]
 
-                if kits:
-                    if tid is not None and votes is not None and tid in votes.acc:
-                        team = team_from_votes(votes.acc[tid], kits)
-                    elif e["frame_probs"] is not None:
-                        team = team_from_votes(e["frame_probs"], kits)
+                if TEAM_MODE == "color":
+                    if tid is not None and tid in team_of:
+                        team = team_of[tid]
+                    elif e["color"] is not None and centroids is not None:
+                        team = classify_color(e["color"], centroids)[0]
+                else:
+                    if kits:
+                        if tid is not None and votes is not None and tid in votes.acc:
+                            team = team_from_votes(votes.acc[tid], kits)
+                        elif e["frame_probs"] is not None:
+                            team = team_from_votes(e["frame_probs"], kits)
 
                 drawn[team if team else "Player"] += 1
                 label_str = draw_entity(frame, "player", team, x1, y1, x2, y2)
@@ -541,8 +775,11 @@ def main():
 
     model = load_yolo_model()
 
-    classifier_path = load_team_classifier()
-    classifier = TeamClassifier(classifier_path)
+    # O classifier só é preciso no modo "classifier".
+    classifier = None
+    if TEAM_MODE == "classifier":
+        classifier_path = load_team_classifier()
+        classifier = TeamClassifier(classifier_path)
 
     files_all, files_videos = list_incoming()
     if not files_videos:
