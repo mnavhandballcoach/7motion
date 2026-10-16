@@ -4,12 +4,11 @@ import json
 import shutil
 import numpy as np
 from collections import Counter
+import requests
 
 from process.core.models import load_yolo_model, load_team_classifier
 from process.core.cropper import crop_with_pad, is_box_too_small
 from process.core.classifier import TeamClassifier
-from process.core.ema import init_track_memory, update_ema, decide_team
-from process.core.fallback import apply_fallback
 from process.core.drawer import draw_entity
 
 from process.io.storage import (
@@ -50,7 +49,7 @@ def save_debug_crop(crop, frame_index, track_id, cls_name=None, conf=None, video
 
 
 # ============================================================
-# PROCESSAMENTO DO VÍDEO
+# PROCESSAMENTO DO VÍDEO (SEM EMA, SEM HEURÍSTICAS)
 # ============================================================
 def process_video(model, classifier, local_video, original_name):
 
@@ -82,14 +81,7 @@ def process_video(model, classifier, local_video, original_name):
     )
 
     frame_index = 0
-
-    team_memory = {}
-    last_team = {}
-    fallback_counter = {}
-    cluster_memory = {}
-
     CLASSIFY_CLASSES = ("player",)
-    team_map = {}
 
     while True:
         ret, frame = cap.read()
@@ -103,7 +95,6 @@ def process_video(model, classifier, local_video, original_name):
         frame_path = os.path.join(frames_dir, frame_name)
 
         players = []
-        frame_classes_raw = []
 
         # ============================================================
         # DETEÇÃO
@@ -139,7 +130,6 @@ def process_video(model, classifier, local_video, original_name):
                     "track_id": track_id,
                     "x1": x1, "y1": y1, "x2": x2, "y2": y2,
                     "crop": crop,
-                    "team_raw": None,
                     "cls_name": None,
                     "conf": None,
                 })
@@ -149,16 +139,12 @@ def process_video(model, classifier, local_video, original_name):
             if base_label not in CLASSIFY_CLASSES:
                 continue
 
-            if track_id is not None:
-                init_track_memory(team_memory, fallback_counter, last_team, track_id)
-
             if is_box_too_small(w_box, h_box):
                 players.append({
                     "role": "player",
                     "track_id": track_id,
                     "x1": x1, "y1": y1, "x2": x2, "y2": y2,
                     "crop": None,
-                    "team_raw": None,
                     "cls_name": None,
                     "conf": None,
                 })
@@ -172,13 +158,12 @@ def process_video(model, classifier, local_video, original_name):
                 "track_id": track_id,
                 "x1": x1, "y1": y1, "x2": x2, "y2": y2,
                 "crop": crop,
-                "team_raw": None,
                 "cls_name": None,
                 "conf": None,
             })
 
         # ============================================================
-        # CLASSIFICADOR
+        # CLASSIFICADOR (CRU)
         # ============================================================
         if classifier is not None:
             for p in players:
@@ -195,103 +180,25 @@ def process_video(model, classifier, local_video, original_name):
 
                 save_debug_crop(crop, frame_index, p["track_id"], cls_name, conf, base_name)
 
-                if conf >= 0.60:
-                    frame_classes_raw.append(cls_name)
-
         # ============================================================
-        # EQUIPAS DOMINANTES
-        # ============================================================
-        frame_team_classes = []
-        if frame_classes_raw:
-            counts = Counter(frame_classes_raw)
-            most_common = counts.most_common(2)
-            frame_team_classes = [c[0] for c in most_common]
-
-        for cls_name in frame_team_classes:
-            if cls_name not in team_map:
-                if len(team_map) == 0:
-                    team_map[cls_name] = "A"
-                elif len(team_map) == 1:
-                    team_map[cls_name] = "B"
-
-        # ============================================================
-        # ATRIBUIR EQUIPA RAW
+        # ANOTAÇÃO CRUA (SEM EQUIPAS)
         # ============================================================
         for p in players:
-            if p["role"] != "player":
-                continue
-
+            role = p["role"]
+            x1, y1, x2, y2 = p["x1"], p["y1"], p["x2"], p["y2"]
             cls_name = p["cls_name"]
             conf = p["conf"]
 
-            if cls_name is None or conf is None:
-                continue
+            label_str = draw_entity(frame, role, cls_name, x1, y1, x2, y2)
+            labels_file.write(f"{frame_name} {label_str}\n")
 
-            if conf < 0.60:
-                continue
-
-            if frame_team_classes and cls_name not in frame_team_classes:
-                continue
-
-            if cls_name in team_map:
-                p["team_raw"] = team_map[cls_name]
-
-        # ============================================================
-        # MEMÓRIA TEMPORAL
-        # ============================================================
-        for p in players:
-            if p["role"] != "player":
-                continue
-
-            track_id = p["track_id"]
-            team_raw = p["team_raw"]
-
-            if track_id is not None and team_raw is not None:
-                cluster_memory.setdefault(track_id, []).append(team_raw)
-                if len(cluster_memory[track_id]) > 10:
-                    cluster_memory[track_id].pop(0)
-
-        # ============================================================
-        # EMA + FALLBACK
-        # ============================================================
-        frame_player_teams = []
-
-        for p in players:
-            role = p["role"]
-            track_id = p["track_id"]
-            x1, y1, x2, y2 = p["x1"], p["y1"], p["x2"], p["y2"]
-            team_raw = p["team_raw"]
-
-            if role == "player":
-                history = cluster_memory.get(track_id, [])
-                team_temporal = max(set(history), key=history.count) if history else team_raw
-
-                if track_id is not None:
-                    update_ema(team_memory, track_id, team_temporal)
-                    team = decide_team(team_memory, track_id)
-                    team = apply_fallback(track_id, team, last_team, fallback_counter)
-                else:
-                    team = team_temporal
-
-                if team is not None:
-                    frame_player_teams.append(team)
-
-                label_str = draw_entity(frame, role, team, x1, y1, x2, y2)
-                labels_file.write(f"{frame_name} {label_str}\n")
-
-        # guarda-redes → equipa dominante
-        majority_team = None
-        if frame_player_teams:
-            countA = frame_player_teams.count("A")
-            countB = frame_player_teams.count("B")
-            majority_team = "A" if countA > countB else "B"
-
+        # guarda-redes sem equipa
         for p in players:
             if p["role"] != "goalkeeper":
                 continue
 
             x1, y1, x2, y2 = p["x1"], p["y1"], p["x2"], p["y2"]
-            label_str = draw_entity(frame, "goalkeeper", majority_team, x1, y1, x2, y2)
+            label_str = draw_entity(frame, "goalkeeper", None, x1, y1, x2, y2)
             labels_file.write(f"{frame_name} {label_str}\n")
 
         cv2.imwrite(frame_path, frame)
