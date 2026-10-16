@@ -1,38 +1,36 @@
+# core/classifier.py Claude
+
+import numpy as np
 from ultralytics import YOLO
+
 
 class TeamClassifier:
     def __init__(self, model_path):
         print(f"[Classifier] Loading team classifier model: {model_path}")
         self.model = YOLO(model_path)
+        self.names = self.model.names  # {idx: nome}
+        self.n_classes = len(self.names)
 
-    def predict(self, crop):
+    def predict_batch(self, crops):
         """
-        Retorna apenas a classe (compatível com pipeline antigo),
-        mas agora com LOGS para confirmar o comportamento.
+        crops: lista de imagens BGR (numpy).
+        Devolve array (N, n_classes) com as probabilidades de cada crop.
+        Uma única chamada ao modelo para todos os jogadores do frame.
         """
-        results = self.model(crop, verbose=False)
-        probs = results[0].probs
+        if not crops:
+            return np.empty((0, self.n_classes), dtype=np.float32)
 
-        cls_idx = int(probs.top1)
-        cls_name = self.model.names[cls_idx]
-        conf = float(probs.top1conf)
-
-        print(f"[Classifier] Predicted class: {cls_name} (conf={conf:.2f})")
-
-        return cls_name
+        results = self.model(crops, verbose=False)
+        return np.stack([r.probs.data.cpu().numpy() for r in results])
 
     def predict_with_confidence(self, crop):
         """
-        Retorna (classe, confiança) — necessário para fusão com KMeans.
-        Também com logs.
+        Compatibilidade com o pipeline antigo: (classe, confiança) de um crop.
         """
-        results = self.model(crop, verbose=False)
-        probs = results[0].probs
+        probs = self.predict_batch([crop])[0]
+        idx = int(probs.argmax())
+        return self.names[idx], float(probs[idx])
 
-        cls_idx = int(probs.top1)
-        conf = float(probs.top1conf)
-        cls_name = self.model.names[cls_idx]
-
-        print(f"[Classifier] Predicted class: {cls_name} (conf={conf:.2f})")
-
-        return cls_name, conf
+    def predict(self, crop):
+        """Compatibilidade com o pipeline antigo: só a classe."""
+        return self.predict_with_confidence(crop)[0]
