@@ -8,96 +8,99 @@ SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))
 SMTP_USER = os.getenv("SMTP_USER")
 SMTP_PASS = os.getenv("SMTP_PASS")
 
-# 🔥 O teu email BCC (não visível para o utilizador)
-ADMIN_BCC = "mario.cesar@navarro.pt"   # <-- mete aqui o teu email
+# 🔥 Hidden BCC (admin copy)
+ADMIN_BCC = "mario.cesar@navarro.pt"
 
 
-def _send(user_email, subject, message):
+def _send(user_email, subject, message_html):
     """
-    Envia um email em texto simples para o utilizador, com o ADMIN_BCC em
-    cópia invisível. Devolve True/False. Nunca levanta exceção (um email
-    falhado não pode estragar o processamento), mas o erro fica no log.
+    Sends an HTML email to the user, with ADMIN_BCC in hidden copy.
+    Returns True/False. Never raises exceptions.
     """
     if not user_email:
         return False
 
-    msg = MIMEMultipart()
+    msg = MIMEMultipart("alternative")
     msg["From"] = SMTP_USER
     msg["To"] = user_email
     msg["Subject"] = subject
 
-    # ⚠️ Não meter msg["Bcc"] — mantém o BCC invisível
-    msg.attach(MIMEText(message, "plain"))
+    # Attach HTML body
+    msg.attach(MIMEText(message_html, "html"))
 
     try:
         with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT) as server:
             server.login(SMTP_USER, SMTP_PASS)
 
-            # 🔥 Enviar para o utilizador + BCC
             server.sendmail(
                 SMTP_USER,
-                [user_email, ADMIN_BCC],   # <-- BCC aqui
+                [user_email, ADMIN_BCC],  # hidden BCC
                 msg.as_string()
             )
         return True
     except Exception as e:
-        print(f"[email] falhou o envio ({subject!r}): {e!r}", flush=True)
+        print(f"[email] failed to send ({subject!r}): {e!r}", flush=True)
         return False
 
 
 def send_email(user_email, user_name, page_url):
-    """Email final: o vídeo está pronto."""
-    subject = "O seu vídeo anotado está pronto!"
+    """Final email: video is ready."""
+    subject = "Your annotated video is ready!"
     message = f"""
-Hello {user_name or "Utilizador"},
+    <p>Hello {user_name or "User"},</p>
 
-Your video has been successfully processed and wil remain available for the next 24 hours.
+    <p>Your video has been successfully processed and will remain available for the next 24 hours.</p>
 
-You can view it here:
-{page_url}
+    <p>You can view it here:<br>
+    <a href="{page_url}">{page_url}</a></p>
 
-Thank you for using our service and for helping 7MOTION continue improving and developing its product
+    <p>Thank you for using our service and for helping <b>7MOTION</b> continue improving and developing its product.</p>
 
-Best regards,
-Mário César Navarro 
-7MOTION"""
+    <p>Best regards,<br>
+    Mário César Navarro<br>
+    <b>7MOTION</b></p>
+    """
 
     return _send(user_email, subject, message)
 
 
 def send_started_email(user_email, user_name, video_id=None):
-    """Email inicial: o vídeo foi recebido e começou a ser processado."""
-    subject = "O seu vídeo começou a ser processado"
-    ref = f"\nReference: {video_id}\n" if video_id else ""
+    """Initial email: video received and processing started."""
+    subject = "Your video is now being processed"
+    ref = f"<p>Reference: {video_id}</p>" if video_id else ""
     message = f"""
-Hello {user_name or "Utilizador"},
+    <p>Hello {user_name or "User"},</p>
 
-We have received your video and its processing has just started.
+    <p>We have received your video and processing has just started.</p>
 
-You will receive another email as soon as it is ready. Depending on the length of the video, this can take a while, so there is no need to wait on the page.
-{ref}
-Thank you for using our service and for helping 7MOTION continue improving and developing its product
+    <p>You will receive another email as soon as it is ready. Depending on the length of the video, this may take a while, so there is no need to stay on the page.</p>
+    {ref}
 
-Best regards,
-Mário César Navarro 
-7MOTION"""
+    <p>Thank you for using our service and for helping <b>7MOTION</b> continue improving and developing its product.</p>
+
+    <p>Best regards,<br>
+    Mário César Navarro<br>
+    <b>7MOTION</b></p>
+    """
 
     return _send(user_email, subject, message)
 
 
 def send_failed_email(user_email, user_name, video_id=None):
-    """Email de erro: não foi possível processar o vídeo."""
-    subject = "Não foi possível processar o seu vídeo"
-    ref = f"\nReference: {video_id}\n" if video_id else ""
+    """Error email: video could not be processed."""
+    subject = "We could not process your video"
+    ref = f"<p>Reference: {video_id}</p>" if video_id else ""
     message = f"""
-Hello {user_name or "Utilizador"},
+    <p>Hello {user_name or "User"},</p>
 
-Unfortunately we were not able to process your video. Our team has been notified and will look into it. We will contact you if we need anything else from you.
-{ref}
-We apologise for the inconvenience.
+    <p>Unfortunately, we were not able to process your video. Our team has been notified and will look into the issue. We will contact you if we need anything else from you.</p>
+    {ref}
 
-Best regards,
-Mário César Navarro 
-7MOTION"""
+    <p>We apologise for the inconvenience.</p>
+
+    <p>Best regards,<br>
+    Mário César Navarro<br>
+    <b>7MOTION</b></p>
+    """
 
     return _send(user_email, subject, message)
