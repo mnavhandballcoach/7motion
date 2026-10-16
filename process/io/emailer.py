@@ -18,15 +18,18 @@ def send_email(user_email, user_name, page_url):
 
     subject = "O seu vídeo anotado está pronto!"
     message = f"""
-Olá {user_name or "Utilizador"},
+Hello {user_name or "Utilizador"},
 
-O seu vídeo foi processado com sucesso.
+Your video has been successfully processed and wil remain available for the next 24 hours.
 
-Pode vê-lo aqui:
+You can view it here:
 {page_url}
 
-Obrigado por utilizar o nosso serviço!
-"""
+Thank you for using our service and for helping 7MOTION continue improving and developing its product
+
+Best regards,
+Mário César Navarro 
+7MOTION"""
 
     msg = MIMEMultipart()
     msg["From"] = SMTP_USER
