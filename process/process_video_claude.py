@@ -8,7 +8,7 @@ import requests
 from concurrent.futures import ThreadPoolExecutor
 
 from process.core.models import load_yolo_model, load_team_classifier
-from process.core.cropper import crop_player, is_box_too_small
+from process.core.cropper import crop_player
 from process.core.classifier import TeamClassifier
 from process.core.drawer import draw_entity
 
@@ -38,6 +38,17 @@ EXCLUDE_CLASSES = {
     for c in os.getenv("TEAM_EXCLUDE_CLASSES", "").split(",")
     if c.strip()
 }
+
+# Tamanho mínimo da box para tentar classificar (antes: 25x40 no cropper).
+# Jogadores mais pequenos que isto nunca recebem votos.
+MIN_BOX_W = int(os.getenv("MIN_BOX_W", "16"))
+MIN_BOX_H = int(os.getenv("MIN_BOX_H", "32"))
+
+# Peso de cada voto = altura da box / (WEIGHT_REF * altura do frame),
+# limitado entre WEIGHT_MIN e 1. Evita que um jogador muito perto (e
+# possivelmente mal classificado) domine, e que os longes valham quase 0.
+WEIGHT_REF = float(os.getenv("VOTE_WEIGHT_REF", "0.20"))
+WEIGHT_MIN = float(os.getenv("VOTE_WEIGHT_MIN", "0.10"))
 
 # Velocidade: cada jogador é classificado em todos os frames nas primeiras
 # WARMUP observações e depois só 1 frame em cada CLASSIFY_EVERY.
@@ -134,6 +145,14 @@ class TrackVotes:
             self.obs[track_id] = 0
         self.acc[track_id] += probs * weight
         self.obs[track_id] += 1
+
+
+def box_too_small(w_box, h_box):
+    return w_box < MIN_BOX_W or h_box < MIN_BOX_H
+
+
+def vote_weight(box_h, frame_h):
+    return float(min(1.0, max(WEIGHT_MIN, box_h / (WEIGHT_REF * float(frame_h)))))
 
 
 def should_classify(votes, track_id, frame_index):
@@ -283,14 +302,16 @@ def analyse_video(model, classifier, local_video):
             else:
                 info = track_info.setdefault(
                     track_id,
-                    {"first": frame_index, "last": frame_index, "n": 0, "sum_h": 0.0},
+                    {"first": frame_index, "last": frame_index, "n": 0, "sum_h": 0.0, "small": 0},
                 )
                 info["last"] = frame_index
                 info["n"] += 1
                 info["sum_h"] += h_box
 
-            if is_box_too_small(w_box, h_box):
+            if box_too_small(w_box, h_box):
                 stats["players_small"] += 1
+                if track_id is not None:
+                    track_info[track_id]["small"] += 1
                 continue
 
             # só faz o crop se este jogador vai ser classificado neste frame
@@ -311,7 +332,7 @@ def analyse_video(model, classifier, local_video):
 
                 for p, pr in zip(batch, probs):
                     if p["track_id"] is not None:
-                        weight = p["box_h"] / float(h)   # mais perto = mais peso
+                        weight = vote_weight(p["box_h"], h)
                         votes.update(p["track_id"], pr, weight)
                     else:
                         p["frame_probs"] = pr
@@ -348,7 +369,7 @@ def log_tracks(run_log, track_info, votes, kits, classifier):
         avg_h = info["sum_h"] / max(n, 1)
         head = (
             f"[track {tid}] frames {info['first']:05d}-{info['last']:05d} "
-            f"(n={n}) alt_media={avg_h:.0f}px"
+            f"(n={n}) alt_media={avg_h:.0f}px pequena={100 * info['small'] / max(n, 1):.0f}%"
         )
 
         vec = votes.acc.get(tid) if votes is not None else None
@@ -395,7 +416,8 @@ def process_video(model, classifier, local_video, original_name, run_log):
         f"[config] CLASSIFY_EVERY={CLASSIFY_EVERY} WARMUP_OBS={WARMUP_OBS} "
         f"TEAM_MIN_MASS={MIN_TEAM_MASS} TEAM_MIN_TRACK_OBS={MIN_TRACK_OBS} "
         f"EXCLUDE={sorted(EXCLUDE_CLASSES) or '-'} UPLOAD_WORKERS={UPLOAD_WORKERS} "
-        f"UPLOAD_FRAMES={int(UPLOAD_FRAMES)} DEBUG_CROPS={int(DEBUG_CROPS)}"
+        f"UPLOAD_FRAMES={int(UPLOAD_FRAMES)} DEBUG_CROPS={int(DEBUG_CROPS)} "
+        f"MIN_BOX={MIN_BOX_W}x{MIN_BOX_H} WEIGHT_REF={WEIGHT_REF} WEIGHT_MIN={WEIGHT_MIN}"
     )
 
     # ---------- passagem 1 ----------
