@@ -1,5 +1,6 @@
 import os
 import time
+import traceback
 import cv2
 import json
 import shutil
@@ -13,10 +14,11 @@ from process.core.classifier import TeamClassifier
 from process.core.drawer import draw_entity
 
 from process.io.storage import (
-    list_incoming, download_video_and_json, upload_file, delete_incoming
+    list_incoming, claim_incoming, download_video_and_json, upload_file,
+    finish_processing, move_to_failed, recover_stale_processing
 )
 from process.io.ffmpeg import cut_video, convert_video_to_safe_format
-from process.io.emailer import send_email
+from process.io.emailer import send_email, send_started_email, send_failed_email
 
 
 # ============================================================
@@ -74,8 +76,15 @@ WEIGHT_MIN = float(os.getenv("VOTE_WEIGHT_MIN", "0.10"))
 # Uploads em paralelo (resultado igual, só mais rápido).
 UPLOAD_WORKERS = int(os.getenv("UPLOAD_WORKERS", "8"))
 
-# Enviar para o Backblaze todos os frames anotados (processed/frames/...).
-UPLOAD_FRAMES = os.getenv("UPLOAD_FRAMES", "1") == "1"
+# Guardar os frames anotados (JPG de cada frame) e enviá-los para
+# processed/frames/... SAVE_FRAMES=0 desliga: não grava nem envia (poupa
+# tempo e espaço). O vídeo anotado continua a ser gerado.
+SAVE_FRAMES = os.getenv("SAVE_FRAMES", os.getenv("UPLOAD_FRAMES", "1")) == "1"
+
+# Guardar o ficheiro de labels (.txt) e enviá-lo para processed/labels/...
+# SAVE_LABELS=0 desliga. O JSON de resultados (processed/results/) já contém
+# as mesmas deteções e mais informação.
+SAVE_LABELS = os.getenv("SAVE_LABELS", "1") == "1"
 
 # Crops de debug: desligados por defeito. Ativar com DEBUG_CROPS=1.
 DEBUG_CROPS = os.getenv("DEBUG_CROPS", "0") == "1"
@@ -612,6 +621,54 @@ def analyse_video(model, classifier, local_video):
 
 
 # ============================================================
+# JSON DE RESULTADOS (base para análises futuras)
+# ============================================================
+def result_object(role, track_id, team, x1, y1, x2, y2):
+    obj = {
+        "role": role,
+        "id": track_id,
+        "team": team,
+        "box": [x1, y1, x2, y2],
+    }
+    if role == "ball":
+        obj["center"] = [(x1 + x2) // 2, (y1 + y2) // 2]
+    else:
+        obj["foot"] = [(x1 + x2) // 2, y2]   # ponto no chão (para mapear o campo)
+    return obj
+
+
+def write_results_json(path, base_name, w, h, fps, frames,
+                       track_info, track_teams, team_descr):
+    tracks = []
+    for tid, info in sorted(track_info.items()):
+        tracks.append({
+            "id": tid,
+            "first_frame": info["first"],
+            "last_frame": info["last"],
+            "detections": info["n"],
+            "team": track_teams.get(tid),
+        })
+
+    data = {
+        "schema": 1,
+        "video": {
+            "name": base_name,
+            "width": w,
+            "height": h,
+            "fps": fps,
+            "frames": len(frames),
+            "team_mode": TEAM_MODE,
+        },
+        "teams": team_descr,
+        "tracks": tracks,
+        "frames": frames,
+    }
+
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, separators=(",", ":"))
+
+
+# ============================================================
 # PROCESSAMENTO DO VÍDEO (2 PASSAGENS)
 # ============================================================
 def process_video(model, classifier, local_video, original_name, run_log):
@@ -635,7 +692,8 @@ def process_video(model, classifier, local_video, original_name, run_log):
         f"WEIGHT_REF={WEIGHT_REF} WEIGHT_MIN={WEIGHT_MIN} "
         f"SKIN_HUE={SKIN_HUE_LO}-{SKIN_HUE_HI} COLOR_FIT_MIN_OBS={COLOR_FIT_MIN_OBS} "
         f"COLOR_ASSIGN_MIN_OBS={COLOR_ASSIGN_MIN_OBS} COLOR_MIN_MARGIN={COLOR_MIN_MARGIN} "
-        f"UPLOAD_WORKERS={UPLOAD_WORKERS} UPLOAD_FRAMES={int(UPLOAD_FRAMES)} "
+        f"UPLOAD_WORKERS={UPLOAD_WORKERS} SAVE_FRAMES={int(SAVE_FRAMES)} "
+        f"SAVE_LABELS={int(SAVE_LABELS)} "
         f"DEBUG_CROPS={int(DEBUG_CROPS)}"
     )
 
@@ -665,9 +723,17 @@ def process_video(model, classifier, local_video, original_name, run_log):
     centroids = None
     team_of = {}
     kits = []
+    track_teams = {}     # track_id -> "A" / "B" / None (para o JSON)
+    team_descr = {}      # descrição de cada equipa (para o JSON)
 
     if TEAM_MODE == "color":
         centroids, team_of, details, info = build_color_teams(colors)
+        track_teams = team_of
+        if centroids is not None:
+            team_descr = {
+                "A": describe_centroid(centroids["A"]),
+                "B": describe_centroid(centroids["B"]),
+            }
         log_color_teams(run_log, info, centroids)
         log_tracks_color(run_log, track_info, colors, team_of, details)
 
@@ -689,11 +755,17 @@ def process_video(model, classifier, local_video, original_name, run_log):
 
         log_tracks_classifier(run_log, track_info, votes, kits, classifier)
 
+        if votes is not None and kits:
+            track_teams = {t: team_from_votes(v, kits) for t, v in votes.acc.items()}
+            team_descr = {"A": str(classifier.names[kits[0]])}
+            if len(kits) > 1:
+                team_descr["B"] = str(classifier.names[kits[1]])
+
     # ---------- passagem 2: desenhar ----------
     t_p2 = time.perf_counter()
 
     cap = cv2.VideoCapture(local_video)
-    labels_file = open(labels_path, "w")
+    labels_file = open(labels_path, "w") if SAVE_LABELS else None
 
     writer = cv2.VideoWriter(
         output_video,
@@ -703,6 +775,8 @@ def process_video(model, classifier, local_video, original_name, run_log):
     )
 
     drawn = {"A": 0, "B": 0, "Player": 0}
+    results_frames = []
+    video_fps = fps if fps > 0 else 30
 
     for frame_index, dets in enumerate(frame_dets):
         ret, frame = cap.read()
@@ -711,6 +785,8 @@ def process_video(model, classifier, local_video, original_name, run_log):
 
         frame_name = f"frame_{frame_index:05d}.jpg"
         frame_path = os.path.join(frames_dir, frame_name)
+
+        objects = []
 
         for e in dets:
             x1, y1, x2, y2 = e["box"]
@@ -734,18 +810,29 @@ def process_video(model, classifier, local_video, original_name, run_log):
 
                 drawn[team if team else "Player"] += 1
                 label_str = draw_entity(frame, "player", team, x1, y1, x2, y2)
+                objects.append(result_object("player", tid, team, x1, y1, x2, y2))
             else:
                 # referee / ball / goalkeeper: sem equipa
                 label_str = draw_entity(frame, label, None, x1, y1, x2, y2)
+                objects.append(result_object(label, e["track_id"], None, x1, y1, x2, y2))
 
-            labels_file.write(f"{frame_name} {label_str}\n")
+            if labels_file is not None:
+                labels_file.write(f"{frame_name} {label_str}\n")
 
-        cv2.imwrite(frame_path, frame)
+        results_frames.append({
+            "i": frame_index,
+            "t": round(frame_index / video_fps, 3),
+            "objects": objects,
+        })
+
+        if SAVE_FRAMES:
+            cv2.imwrite(frame_path, frame)
         writer.write(frame)
 
     cap.release()
     writer.release()
-    labels_file.close()
+    if labels_file is not None:
+        labels_file.close()
 
     p2_s = time.perf_counter() - t_p2
     run_log.add("")
@@ -753,6 +840,18 @@ def process_video(model, classifier, local_video, original_name, run_log):
     run_log.add(
         f"[resumo] deteções de jogador desenhadas: "
         f"Team A={drawn['A']} | Team B={drawn['B']} | Player={drawn['Player']}"
+    )
+
+    # ---------- JSON de resultados ----------
+    os.makedirs("output_results", exist_ok=True)
+    results_path = os.path.join("output_results", f"{base_name}.json")
+    write_results_json(
+        results_path, base_name, w, h, video_fps, results_frames,
+        track_info, track_teams, team_descr
+    )
+    run_log.add(
+        f"[results] JSON com {len(results_frames)} frames "
+        f"({os.path.getsize(results_path) / 1024:.0f} KB)"
     )
 
     # ---------- enviar crops de debug (em paralelo) ----------
@@ -765,36 +864,54 @@ def process_video(model, classifier, local_video, original_name, run_log):
                 pairs.append((local, f"processed/crops/{base_name}/{rel}"))
         upload_many(pairs, run_log, "crops de debug")
 
-    return output_video, frames_dir, labels_path
+    return output_video, frames_dir, labels_path, results_path
 
 
 # ============================================================
 # MAIN
 # ============================================================
-def main():
+# Itens em processing/ há mais tempo que isto vieram de uma corrida que morreu.
+STALE_PROCESSING_MINUTES = int(os.getenv("STALE_PROCESSING_MINUTES", "360"))
 
-    model = load_yolo_model()
+WORK_DIRS = (
+    "output", "output_frames", "output_labels", "output_logs",
+    "output_results", "debug_crops",
+)
 
-    # O classifier só é preciso no modo "classifier".
-    classifier = None
-    if TEAM_MODE == "classifier":
-        classifier_path = load_team_classifier()
-        classifier = TeamClassifier(classifier_path)
 
-    files_all, files_videos = list_incoming()
-    if not files_videos:
-        print("No videos in incoming/.")
+def _remove_file(path):
+    try:
+        if path and os.path.exists(path):
+            os.remove(path)
+    except Exception as e:
+        print(f"[cleanup] não foi possível apagar {path}: {e!r}")
+
+
+def process_one(model, classifier, key):
+    """
+    Fluxo de um vídeo:
+      1. reservar:  incoming/ -> processing/  (nada se perde se a corrida morrer)
+      2. descarregar e avisar o utilizador de que o processamento começou
+      3. processar e enviar os resultados
+      4. sucesso: apagar de processing/
+         erro:    mover para failed/ (vídeo + json + log) e avisar
+    """
+    base_name = os.path.splitext(os.path.basename(key))[0]
+    run_log = RunLog(base_name)
+    t_total = time.perf_counter()
+
+    try:
+        claimed_video, claimed_json = claim_incoming(key)
+    except Exception as e:
+        print(f"[claim] não foi possível reservar {key}: {e!r} (fica para a próxima corrida)")
         return
 
-    for file in files_videos:
-        t_total = time.perf_counter()
+    local_video = local_json = cut_path = safe_video = None
+    user_email = user_name = None
+    ok = False
 
-        key = file["Key"]
-        base_name = os.path.splitext(os.path.basename(key))[0]
-        run_log = RunLog(base_name)
-
-        local_video, local_json, json_key = download_video_and_json(key)
-        delete_incoming(key, json_key)
+    try:
+        local_video, local_json, _ = download_video_and_json(claimed_video)
 
         with open(local_json, "r") as f:
             data = json.load(f)
@@ -804,12 +921,15 @@ def main():
         start_time = int(data.get("start", 0))
         duration = int(data.get("duration", 0))
 
+        # Avisar o utilizador antes de começar
+        send_started_email(user_email, user_name, base_name)
+
         t_prep = time.perf_counter()
         cut_path = cut_video(local_video, start_time, duration) if duration > 0 else local_video
         safe_video = convert_video_to_safe_format(cut_path)
         prep_s = time.perf_counter() - t_prep
 
-        output_video, frames_dir, labels_path = process_video(
+        output_video, frames_dir, labels_path, results_path = process_video(
             model, classifier, safe_video, os.path.basename(key), run_log
         )
         run_log.add(f"[time] cortar/converter vídeo (ffmpeg): {prep_s:.1f}s")
@@ -818,7 +938,7 @@ def main():
         upload_file(output_video, f"processed/{os.path.basename(output_video)}")
         upload_file(local_video, f"processed/originals/{os.path.basename(key)}")
 
-        if UPLOAD_FRAMES:
+        if SAVE_FRAMES:
             pairs = []
             for root, dirs, files_local in os.walk(frames_dir):
                 for f in files_local:
@@ -828,13 +948,16 @@ def main():
                     ))
             upload_many(pairs, run_log, "frames")
 
-        upload_file(labels_path, f"processed/labels/{os.path.basename(labels_path)}")
+        if SAVE_LABELS:
+            upload_file(labels_path, f"processed/labels/{os.path.basename(labels_path)}")
+        upload_file(results_path, f"processed/results/{os.path.basename(results_path)}")
 
         # ---------- guardar o log em processed/logs/<nome do vídeo>.log ----------
         run_log.add(f"[time] TOTAL até aqui: {time.perf_counter() - t_total:.1f}s")
         log_path = run_log.save()
         upload_file(log_path, f"processed/logs/{os.path.basename(log_path)}")
 
+        # ---------- página + email final ----------
         video_url = (
             f"https://f003.backblazeb2.com/file/"
             f"{os.getenv('VIDEOS_BUCKET', 'handball-videos')}/"
@@ -857,15 +980,66 @@ def main():
 
         send_email(user_email, user_name, page_url)
 
-        shutil.rmtree("output", ignore_errors=True)
-        shutil.rmtree("output_frames", ignore_errors=True)
-        shutil.rmtree("output_labels", ignore_errors=True)
-        shutil.rmtree("output_logs", ignore_errors=True)
-        shutil.rmtree("debug_crops", ignore_errors=True)
+        ok = True
 
-        os.remove(local_video)
-        os.remove(safe_video)
-        os.remove(local_json)
+    except Exception as e:
+        run_log.add("")
+        run_log.add(f"[ERRO] {type(e).__name__}: {e}")
+        run_log.add(traceback.format_exc())
+
+        # log de erro em failed/logs/<nome>.log
+        try:
+            log_path = run_log.save()
+            upload_file(log_path, f"failed/logs/{os.path.basename(log_path)}")
+        except Exception as e2:
+            print(f"[erro] não foi possível guardar o log de erro: {e2!r}")
+
+        # vídeo + json para failed/
+        try:
+            move_to_failed(claimed_video, claimed_json)
+        except Exception as e2:
+            print(f"[erro] não foi possível mover para failed/: {e2!r}")
+
+        send_failed_email(user_email, user_name, base_name)
+
+    finally:
+        for path in (local_video, local_json, safe_video, cut_path):
+            _remove_file(path)
+        for d in WORK_DIRS:
+            shutil.rmtree(d, ignore_errors=True)
+
+    # Sucesso: o vídeo já não precisa de ficar em processing/
+    if ok:
+        try:
+            finish_processing(claimed_video, claimed_json)
+        except Exception as e:
+            print(f"[aviso] processado, mas não foi possível limpar processing/: {e!r}")
+
+
+def main():
+
+    # Itens presos em processing/ (corrida anterior que morreu) -> failed/
+    try:
+        for stale_key in recover_stale_processing(STALE_PROCESSING_MINUTES):
+            print(f"[recover] {stale_key} estava preso em processing/ -> failed/")
+    except Exception as e:
+        print(f"[recover] não foi possível verificar processing/: {e!r}")
+
+    files_all, files_videos = list_incoming()
+    if not files_videos:
+        print("No videos in incoming/.")
+        return
+
+    model = load_yolo_model()
+
+    # O classifier só é preciso no modo "classifier".
+    classifier = None
+    if TEAM_MODE == "classifier":
+        classifier_path = load_team_classifier()
+        classifier = TeamClassifier(classifier_path)
+
+    for file in files_videos:
+        process_one(model, classifier, file["Key"])
 
 
 if __name__ == "__main__":
