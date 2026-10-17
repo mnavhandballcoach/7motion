@@ -42,7 +42,7 @@ jobs:
       env:
         AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
         AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-      run: python process/io/check_incoming.py
+      run: python process/check_incoming.py
 
   process:
     needs: check
@@ -94,6 +94,11 @@ jobs:
         SMTP_PASS: ${{ secrets.SMTP_PASS }}
 
         TEAM_MODE: "color"
+
+        # Frames anotados (JPG por frame) e labels (.txt): "0" = não gravar nem enviar.
+        # O vídeo anotado e o JSON de resultados continuam a ser gerados.
+        SAVE_FRAMES: "0"
+        SAVE_LABELS: "0"
 
         # Crops de debug: "1" para analisar, "0" em produção (poupa tempo e espaço)
         DEBUG_CROPS: "0"
